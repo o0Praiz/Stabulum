@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20BurnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+/**
+ * @title Stabulum
+ * @dev Implementation of the Stabulum stablecoin
+ */
+contract Stabulum is 
+    Initializable, 
+    ERC20Upgradeable, 
+    ERC20BurnableUpgradeable, 
+    ERC20PausableUpgradeable, 
+    AccessControlUpgradeable, 
+    UUPSUpgradeable 
+{
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant BLACKLISTER_ROLE = keccak256("BLACKLISTER_ROLE");
+    
+    // KYC integration
+    address public kycProviderContract;
+    
+    // Fee structure
+    uint256 public transferFee; // Fee in basis points (1/100 of a percent)
+    address public feeCollector;
+    
+    // Blacklisting for regulatory compliance
+    mapping(address => bool) public blacklisted;
+    
+    // Events
+    event TransferFeesCollected(address indexed from, address indexed to, uint256 amount);
+    event BlacklistStatusChanged(address indexed account, bool status);
+    event KYCProviderChanged(address indexed oldProvider, address indexed newProvider);
+    event FeeCollectorChanged(address indexed oldCollector, address indexed newCollector);
+    event FeeUpdated(uint256 oldFee, uint256 newFee);
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @dev Initializes the Stabulum contract
+     */
+    function initialize(
+        address admin,
+        address minter,
+        address pauser,
+        address blacklister,
+        address _kycProviderContract,
+        address _feeCollector
+    ) initializer public {
+        __ERC20_init("Stabulum", "STAB");
+        __ERC20Burnable_init();
+        __ERC20Pausable_init();
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(MINTER_ROLE, minter);
+        _grantRole(PAUSER_ROLE, pauser);
+        _grantRole(UPGRADER_ROLE, admin);
+        _grantRole(BLACKLISTER_ROLE, blacklister);
+        
+        kycProviderContract = _kycProviderContract;
+        transferFee = 0; // Initially 0
+        feeCollector = _feeCollector;
+    }
+
+    /**
+     * @dev Mints new tokens
+     * @param to The address that will receive the minted tokens
+     * @param amount The amount of tokens to mint
+     */
+    function mint(address to, uint256 amount) public onlyRole(MINTER_ROLE) {
+        _mint(to, amount);
+    }
+
+    /**
+     * @dev Pauses all token transfers
+     */
+    function pause() public onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @dev Unpauses all token transfers
+     */
+    function unpause() public onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @dev Sets the fee collector address
+     * @param newFeeCollector The new fee collector address
+     */
+    function setFeeCollector(address newFeeCollector) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        address oldCollector = feeCollector;
+        feeCollector = newFeeCollector;
+        emit FeeCollectorChanged(oldCollector, newFeeCollector);
+    }
+
+    /**
+     * @dev Sets the transfer fee in basis points
+     * @param newFee The new fee in basis points (1/100 of a percent)
+     */
+    function setTransferFee(uint256 newFee) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newFee <= 100, "Fee cannot exceed 1%"); // Max fee is 1%
+        uint256 oldFee = transferFee;
+        transferFee = newFee;
+        emit FeeUpdated(oldFee, newFee);
+    }
+
+    /**
+     * @dev Changes the KYC provider contract
+     * @param newProvider The address of the new KYC provider contract
+     */
+    function setKYCProvider(address newProvider) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        address oldProvider = kycProviderContract;
+        kycProviderContract = newProvider;
+        emit KYCProviderChanged(oldProvider, newProvider);
+    }
+
+    /**
+     * @dev Adds an address to the blacklist
+     * @param account The address to blacklist
+     */
+    function blacklist(address account) public onlyRole(BLACKLISTER_ROLE) {
+        blacklisted[account] = true;
+        emit BlacklistStatusChanged(account, true);
+    }
+
+    /**
+     * @dev Removes an address from the blacklist
+     * @param account The address to remove from the blacklist
+     */
+    function unBlacklist(address account) public onlyRole(BLACKLISTER_ROLE) {
+        blacklisted[account] = false;
+        emit BlacklistStatusChanged(account, false);
+    }
+
+    /**
+     * @dev Check if the user is KYC verified
+     * @param user The address to check
+     * @return bool Whether the user is KYC verified
+     */
+    function isKYCVerified(address user) public view returns (bool) {
+        // Interface for KYC provider contract
+        (bool success, bytes memory data) = kycProviderContract.staticcall(
+            abi.encodeWithSignature("isKYCVerified(address)", user)
+        );
+
+        if (success && data.length >= 32) {
+            return abi.decode(data, (bool));
+        }
+        return false;
+    }
+
+    /**
+     * @dev Override ERC20 transfer function to check blacklist and collect fees
+     */
+    function transfer(address to, uint256 amount) public override returns (bool) {
+        require(!blacklisted[msg.sender], "Sender is blacklisted");
+        require(!blacklisted[to], "Recipient is blacklisted");
+        require(isKYCVerified(msg.sender), "Sender not KYC verified");
+        require(isKYCVerified(to), "Recipient not KYC verified");
+        
+        if (transferFee > 0) {
+            uint256 feeAmount = (amount * transferFee) / 10000; // Convert basis points
+            uint256 amountAfterFee = amount - feeAmount;
+            
+            super.transfer(feeCollector, feeAmount);
+            super.transfer(to, amountAfterFee);
+            
+            emit TransferFeesCollected(msg.sender, to, feeAmount);
+            return true;
+        } else {
+            return super.transfer(to, amount);
+        }
+    }
+
+    /**
+     * @dev Override ERC20 transferFrom function to check blacklist and collect fees
+     */
+    function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
+        require(!blacklisted[from], "Sender is blacklisted");
+        require(!blacklisted[to], "Recipient is blacklisted");
+        require(isKYCVerified(from), "Sender not KYC verified");
+        require(isKYCVerified(to), "Recipient not KYC verified");
+        
+        if (transferFee > 0) {
+            uint256 feeAmount = (amount * transferFee) / 10000; // Convert basis points
+            uint256 amountAfterFee = amount - feeAmount;
+            
+            super.transferFrom(from, feeCollector, feeAmount);
+            super.transferFrom(from, to, amountAfterFee);
+            
+            emit TransferFeesCollected(from, to, feeAmount);
+            return true;
+        } else {
+            return super.transferFrom(from, to, amount);
+        }
+    }
+
+    /**
+     * @dev Hook that is called before any transfer of tokens.
+     */
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal override(ERC20Upgradeable, ERC20PausableUpgradeable) {
+        super._beforeTokenTransfer(from, to, amount);
+    }
+
+    /**
+     * @dev Returns the address of the current owner (admin role)
+     */
+    function owner() public view returns (address) {
+        return getRoleMember(DEFAULT_ADMIN_ROLE, 0);
+    }
+
+    /**
+     * @dev Function to authorize an upgrade to the implementation
+     */
+    function _authorizeUpgrade(address newImplementation) internal onlyRole(UPGRADER_ROLE) override {}
+}

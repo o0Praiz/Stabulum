@@ -1,0 +1,242 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+/**
+ * @title StabulumAMM
+ * @dev Automated Market Maker for Stabulum stablecoin
+ * Provides liquidity and ensures price stability through automated swaps
+ */
+contract StabulumAMM is ReentrancyGuard, AccessControl {
+    using SafeERC20 for IERC20;
+    using SafeMath for uint256;
+
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    
+    // Stabulum token
+    IERC20 public stabulum;
+    
+    // Collateral tokens supported by the AMM
+    mapping(address => bool) public supportedCollaterals;
+    mapping(address => uint256) public collateralPoolSize;
+    
+    // Pool parameters
+    uint256 public constant FEE_DENOMINATOR = 10000;
+    uint256 public swapFee = 5; // 0.05% default fee
+    uint256 public stabilityFee = 2; // 0.02% stability fee
+    
+    // Price impact parameters
+    uint256 public maxSlippage = 50; // 0.5% max slippage
+    
+    // Treasury address that receives fees
+    address public treasury;
+    
+    // Events
+    event CollateralAdded(address indexed token, uint256 amount);
+    event CollateralRemoved(address indexed token, uint256 amount);
+    event SwapExecuted(address indexed user, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
+    event FeeUpdated(uint256 swapFee, uint256 stabilityFee);
+    event CollateralWhitelisted(address indexed token, bool status);
+    
+    constructor(address _stabulum, address _treasury) {
+        require(_stabulum != address(0), "Invalid Stabulum address");
+        require(_treasury != address(0), "Invalid treasury address");
+        
+        stabulum = IERC20(_stabulum);
+        treasury = _treasury;
+        
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(OPERATOR_ROLE, msg.sender);
+    }
+    
+    /**
+     * @dev Add a new collateral token to the whitelist
+     * @param token Address of the collateral token
+     */
+    function addCollateral(address token) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(token != address(0), "Invalid token address");
+        require(!supportedCollaterals[token], "Collateral already supported");
+        
+        supportedCollaterals[token] = true;
+        emit CollateralWhitelisted(token, true);
+    }
+    
+    /**
+     * @dev Remove a collateral token from the whitelist
+     * @param token Address of the collateral token
+     */
+    function removeCollateral(address token) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(supportedCollaterals[token], "Collateral not supported");
+        
+        supportedCollaterals[token] = false;
+        emit CollateralWhitelisted(token, false);
+    }
+    
+    /**
+     * @dev Provide liquidity to the AMM
+     * @param token Address of the collateral token
+     * @param amount Amount of collateral to add
+     */
+    function addLiquidity(address token, uint256 amount) external nonReentrant {
+        require(supportedCollaterals[token], "Collateral not supported");
+        require(amount > 0, "Amount must be greater than 0");
+        
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        collateralPoolSize[token] = collateralPoolSize[token].add(amount);
+        
+        emit CollateralAdded(token, amount);
+    }
+    
+    /**
+     * @dev Remove liquidity from the AMM
+     * @param token Address of the collateral token
+     * @param amount Amount of collateral to remove
+     */
+    function removeLiquidity(address token, uint256 amount) external nonReentrant onlyRole(OPERATOR_ROLE) {
+        require(supportedCollaterals[token], "Collateral not supported");
+        require(amount > 0, "Amount must be greater than 0");
+        require(collateralPoolSize[token] >= amount, "Insufficient liquidity");
+        
+        collateralPoolSize[token] = collateralPoolSize[token].sub(amount);
+        IERC20(token).safeTransfer(msg.sender, amount);
+        
+        emit CollateralRemoved(token, amount);
+    }
+    
+    /**
+     * @dev Swap collateral for Stabulum
+     * @param token Address of the collateral token
+     * @param amount Amount of collateral to swap
+     * @param minAmountOut Minimum amount of Stabulum to receive
+     * @return amountOut The amount of Stabulum received
+     */
+    function swapCollateralForStabulum(address token, uint256 amount, uint256 minAmountOut) 
+        external 
+        nonReentrant 
+        returns (uint256 amountOut) 
+    {
+        require(supportedCollaterals[token], "Collateral not supported");
+        require(amount > 0, "Amount must be greater than 0");
+        
+        // Get price from oracle (implementation would depend on the existing oracle)
+        uint256 collateralPrice = getCollateralPrice(token);
+        
+        // Calculate amount out based on price and fees
+        uint256 baseAmount = amount.mul(collateralPrice).div(1e18);
+        uint256 feeAmount = baseAmount.mul(swapFee).div(FEE_DENOMINATOR);
+        uint256 stabilityAmount = baseAmount.mul(stabilityFee).div(FEE_DENOMINATOR);
+        amountOut = baseAmount.sub(feeAmount).sub(stabilityAmount);
+        
+        // Check slippage
+        require(amountOut >= minAmountOut, "Slippage too high");
+        
+        // Transfer collateral from user to AMM
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        collateralPoolSize[token] = collateralPoolSize[token].add(amount);
+        
+        // Send fees to treasury
+        uint256 totalFees = feeAmount.add(stabilityAmount);
+        stabulum.safeTransfer(treasury, totalFees);
+        
+        // Transfer Stabulum to user
+        stabulum.safeTransfer(msg.sender, amountOut);
+        
+        emit SwapExecuted(msg.sender, token, address(stabulum), amount, amountOut);
+        
+        return amountOut;
+    }
+    
+    /**
+     * @dev Swap Stabulum for collateral
+     * @param token Address of the collateral token
+     * @param amount Amount of Stabulum to swap
+     * @param minAmountOut Minimum amount of collateral to receive
+     * @return amountOut The amount of collateral received
+     */
+    function swapStabulumForCollateral(address token, uint256 amount, uint256 minAmountOut) 
+        external 
+        nonReentrant 
+        returns (uint256 amountOut) 
+    {
+        require(supportedCollaterals[token], "Collateral not supported");
+        require(amount > 0, "Amount must be greater than 0");
+        
+        // Get price from oracle
+        uint256 collateralPrice = getCollateralPrice(token);
+        
+        // Calculate amount out based on price and fees
+        uint256 baseAmount = amount.mul(1e18).div(collateralPrice);
+        uint256 feeAmount = baseAmount.mul(swapFee).div(FEE_DENOMINATOR);
+        uint256 stabilityAmount = baseAmount.mul(stabilityFee).div(FEE_DENOMINATOR);
+        amountOut = baseAmount.sub(feeAmount).sub(stabilityAmount);
+        
+        // Check slippage
+        require(amountOut >= minAmountOut, "Slippage too high");
+        
+        // Check if there's enough collateral in the pool
+        require(collateralPoolSize[token] >= amountOut, "Insufficient liquidity");
+        
+        // Transfer Stabulum from user to AMM
+        stabulum.safeTransferFrom(msg.sender, address(this), amount);
+        
+        // Send fees to treasury
+        uint256 totalFeeInCollateral = feeAmount.add(stabilityAmount);
+        collateralPoolSize[token] = collateralPoolSize[token].sub(amountOut);
+        
+        // Transfer collateral to user
+        IERC20(token).safeTransfer(msg.sender, amountOut);
+        
+        emit SwapExecuted(msg.sender, address(stabulum), token, amount, amountOut);
+        
+        return amountOut;
+    }
+    
+    /**
+     * @dev Update swap fees
+     * @param _swapFee New swap fee (in basis points)
+     * @param _stabilityFee New stability fee (in basis points)
+     */
+    function updateFees(uint256 _swapFee, uint256 _stabilityFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_swapFee <= 100, "Swap fee too high"); // Max 1%
+        require(_stabilityFee <= 50, "Stability fee too high"); // Max 0.5%
+        
+        swapFee = _swapFee;
+        stabilityFee = _stabilityFee;
+        
+        emit FeeUpdated(_swapFee, _stabilityFee);
+    }
+    
+    /**
+     * @dev Get the price of a collateral token (placeholder for oracle integration)
+     * @param token Address of the collateral token
+     * @return price Price of the collateral token in relation to Stabulum (with 18 decimals)
+     */
+    function getCollateralPrice(address token) internal view returns (uint256) {
+        // In production, this would call the Stabulum Price Oracle
+        // For now, we'll return a placeholder value
+        return 1e18; // 1:1 for simplicity
+    }
+    
+    /**
+     * @dev Update the treasury address
+     * @param _treasury New treasury address
+     */
+    function setTreasury(address _treasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_treasury != address(0), "Invalid treasury address");
+        treasury = _treasury;
+    }
+    
+    /**
+     * @dev Update the maximum slippage allowed
+     * @param _maxSlippage New maximum slippage (in basis points)
+     */
+    function setMaxSlippage(uint256 _maxSlippage) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_maxSlippage <= 200, "Max slippage too high"); // Max 2%
+        maxSlippage = _maxSlippage;
+    }
+}

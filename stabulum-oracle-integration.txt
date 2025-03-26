@@ -1,0 +1,294 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+    function description() external view returns (string memory);
+    function version() external view returns (uint256);
+    function getRoundData(uint80 _roundId) external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+    function latestRoundData() external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+}
+
+/**
+ * @title Stabulum Oracle Integration Contract
+ * @dev A contract for integrating with price oracles to ensure price stability
+ */
+contract StabulumOracleIntegration is Ownable, ReentrancyGuard {
+    using SafeMath for uint256;
+
+    // Supported price feeds
+    struct PriceFeed {
+        address feedAddress;      // Address of the price feed contract
+        uint8 decimals;           // Number of decimals for this price feed
+        string description;       // Description of the price feed
+        bool isActive;            // Whether this price feed is active
+        uint256 stalePeriod;      // Time in seconds after which the price is considered stale
+    }
+    
+    // Mapping from asset symbol to price feed
+    mapping(string => PriceFeed) public priceFeeds;
+    
+    // Array of tracked assets
+    string[] public trackedAssets;
+    
+    // Trusted addresses that can update price feeds in emergency situations
+    mapping(address => bool) public trustedOracles;
+    
+    // Manual price updates (used as fallback)
+    struct ManualPrice {
+        uint256 price;            // Price in USD with 8 decimals
+        uint256 timestamp;        // Timestamp of the update
+        address updatedBy;        // Address that updated the price
+    }
+    
+    // Mapping from asset symbol to manual price
+    mapping(string => ManualPrice) public manualPrices;
+    
+    // Events
+    event PriceFeedAdded(string indexed asset, address feedAddress, string description);
+    event PriceFeedUpdated(string indexed asset, address feedAddress, bool isActive, uint256 stalePeriod);
+    event TrustedOracleUpdated(address indexed oracle, bool isTrusted);
+    event ManualPriceUpdated(string indexed asset, uint256 price, address updatedBy);
+    
+    /**
+     * @dev Constructor
+     */
+    constructor() {
+        // Initialize with owner as trusted oracle
+        trustedOracles[msg.sender] = true;
+    }
+    
+    /**
+     * @notice Add a new price feed for an asset
+     * @param _asset Symbol of the asset
+     * @param _feedAddress Address of the price feed contract
+     * @param _stalePeriod Time in seconds after which the price is considered stale
+     */
+    function addPriceFeed(
+        string memory _asset,
+        address _feedAddress,
+        uint256 _stalePeriod
+    ) external onlyOwner {
+        require(_feedAddress != address(0), "Feed address cannot be zero");
+        require(_stalePeriod > 0, "Stale period must be greater than zero");
+        require(bytes(_asset).length > 0, "Asset symbol cannot be empty");
+        
+        // Check if the asset already exists
+        bool assetExists = false;
+        for (uint256 i = 0; i < trackedAssets.length; i++) {
+            if (keccak256(bytes(trackedAssets[i])) == keccak256(bytes(_asset))) {
+                assetExists = true;
+                break;
+            }
+        }
+        
+        if (!assetExists) {
+            trackedAssets.push(_asset);
+        }
+        
+        // Get feed information
+        AggregatorV3Interface feed = AggregatorV3Interface(_feedAddress);
+        uint8 decimals = feed.decimals();
+        string memory description = feed.description();
+        
+        // Add the price feed
+        priceFeeds[_asset] = PriceFeed({
+            feedAddress: _feedAddress,
+            decimals: decimals,
+            description: description,
+            isActive: true,
+            stalePeriod: _stalePeriod
+        });
+        
+        emit PriceFeedAdded(_asset, _feedAddress, description);
+    }
+    
+    /**
+     * @notice Update an existing price feed
+     * @param _asset Symbol of the asset
+     * @param _feedAddress New address of the price feed contract
+     * @param _isActive Whether this price feed is active
+     * @param _stalePeriod New stale period in seconds
+     */
+    function updatePriceFeed(
+        string memory _asset,
+        address _feedAddress,
+        bool _isActive,
+        uint256 _stalePeriod
+    ) external onlyOwner {
+        require(priceFeeds[_asset].feedAddress != address(0), "Price feed does not exist");
+        require(_feedAddress != address(0), "Feed address cannot be zero");
+        require(_stalePeriod > 0, "Stale period must be greater than zero");
+        
+        // Update the price feed
+        priceFeeds[_asset].feedAddress = _feedAddress;
+        priceFeeds[_asset].isActive = _isActive;
+        priceFeeds[_asset].stalePeriod = _stalePeriod;
+        
+        // Update decimals and description if the feed address changed
+        if (_feedAddress != priceFeeds[_asset].feedAddress) {
+            AggregatorV3Interface feed = AggregatorV3Interface(_feedAddress);
+            priceFeeds[_asset].decimals = feed.decimals();
+            priceFeeds[_asset].description = feed.description();
+        }
+        
+        emit PriceFeedUpdated(_asset, _feedAddress, _isActive, _stalePeriod);
+    }
+    
+    /**
+     * @notice Add or remove a trusted oracle
+     * @param _oracle Address of the oracle
+     * @param _isTrusted Whether this oracle is trusted
+     */
+    function updateTrustedOracle(address _oracle, bool _isTrusted) external onlyOwner {
+        require(_oracle != address(0), "Oracle cannot be zero address");
+        trustedOracles[_oracle] = _isTrusted;
+        emit TrustedOracleUpdated(_oracle, _isTrusted);
+    }
+    
+    /**
+     * @notice Update the price of an asset manually (used as fallback)
+     * @param _asset Symbol of the asset
+     * @param _price Price in USD with 8 decimals
+     */
+    function updateManualPrice(string memory _asset, uint256 _price) external {
+        require(trustedOracles[msg.sender], "Only trusted oracles can update manual prices");
+        
+        manualPrices[_asset] = ManualPrice({
+            price: _price,
+            timestamp: block.timestamp,
+            updatedBy: msg.sender
+        });
+        
+        emit ManualPriceUpdated(_asset, _price, msg.sender);
+    }
+    
+    /**
+     * @notice Get the latest price for an asset
+     * @param _asset Symbol of the asset
+     * @return price Price in USD with 8 decimals
+     * @return timestamp Timestamp of the price update
+     * @return isManual Whether this price is a manual update
+     */
+    function getLatestPrice(string memory _asset) public view returns (uint256 price, uint256 timestamp, bool isManual) {
+        PriceFeed storage feed = priceFeeds[_asset];
+        
+        // Check if the price feed exists and is active
+        if (feed.feedAddress != address(0) && feed.isActive) {
+            // Get the latest price from the oracle
+            try AggregatorV3Interface(feed.feedAddress).latestRoundData() returns (
+                uint80 roundId,
+                int256 answer,
+                uint256 startedAt,
+                uint256 updatedAt,
+                uint80 answeredInRound
+            ) {
+                // Check if the price is stale
+                if (block.timestamp <= updatedAt.add(feed.stalePeriod)) {
+                    // Convert the price to 8 decimals if necessary
+                    if (feed.decimals == 8) {
+                        price = uint256(answer);
+                    } else if (feed.decimals < 8) {
+                        price = uint256(answer).mul(10**(8 - feed.decimals));
+                    } else {
+                        price = uint256(answer).div(10**(feed.decimals - 8));
+                    }
+                    
+                    timestamp = updatedAt;
+                    isManual = false;
+                    return (price, timestamp, isManual);
+                }
+            } catch {
+                // If there's an error, fall back to manual price
+            }
+        }
+        
+        // Fall back to manual price if available
+        ManualPrice storage manualPrice = manualPrices[_asset];
+        if (manualPrice.timestamp > 0) {
+            price = manualPrice.price;
+            timestamp = manualPrice.timestamp;
+            isManual = true;
+            return (price, timestamp, isManual);
+        }
+        
+        // If no price is available, revert
+        revert("No valid price available");
+    }
+    
+    /**
+     * @notice Get the number of tracked assets
+     * @return Number of tracked assets
+     */
+    function getTrackedAssetCount() external view returns (uint256) {
+        return trackedAssets.length;
+    }
+    
+    /**
+     * @notice Check if a price feed is stale
+     * @param _asset Symbol of the asset
+     * @return Whether the price feed is stale
+     */
+    function isPriceFeedStale(string memory _asset) external view returns (bool) {
+        PriceFeed storage feed = priceFeeds[_asset];
+        
+        // Check if the price feed exists and is active
+        if (feed.feedAddress != address(0) && feed.isActive) {
+            // Get the latest price from the oracle
+            try AggregatorV3Interface(feed.feedAddress).latestRoundData() returns (
+                uint80 roundId,
+                int256 answer,
+                uint256 startedAt,
+                uint256 updatedAt,
+                uint80 answeredInRound
+            ) {
+                // Check if the price is stale
+                return block.timestamp > updatedAt.add(feed.stalePeriod);
+            } catch {
+                return true;
+            }
+        }
+        
+        return true;
+    }
+    
+    /**
+     * @notice Get multiple asset prices in a single call
+     * @param _assets Array of asset symbols
+     * @return prices Array of prices in USD with 8 decimals
+     * @return timestamps Array of timestamps of the price updates
+     * @return isManual Array of booleans indicating whether each price is a manual update
+     */
+    function getMultiplePrices(string[] memory _assets) external view returns (
+        uint256[] memory prices,
+        uint256[] memory timestamps,
+        bool[] memory isManual
+    ) {
+        uint256 length = _assets.length;
+        prices = new uint256[](length);
+        timestamps = new uint256[](length);
+        isManual = new bool[](length);
+        
+        for (uint256 i = 0; i < length; i++) {
+            (prices[i], timestamps[i], isManual[i]) = getLatestPrice(_assets[i]);
+        }
+        
+        return (prices, timestamps, isManual);
+    }
+}

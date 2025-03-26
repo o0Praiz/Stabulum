@@ -1,0 +1,278 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+/**
+ * @title StabulumPriceOracle
+ * @dev Contract to obtain and aggregate price data for the Stabulum stablecoin
+ */
+contract StabulumPriceOracle is AccessControl {
+    using SafeMath for uint256;
+
+    bytes32 public constant ORACLE_UPDATER_ROLE = keccak256("ORACLE_UPDATER_ROLE");
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+
+    // Price sources
+    enum PriceSource {
+        CHAINLINK,
+        MANUAL,
+        DEX
+    }
+
+    struct PriceData {
+        uint256 price;
+        uint256 timestamp;
+        PriceSource source;
+    }
+
+    // Current price data
+    PriceData public latestPrice;
+    
+    // Chainlink price feed addresses
+    address public stableCoinUsdPriceFeed;
+    address public ethUsdPriceFeed;
+    
+    // DEX price source
+    address public dexPairAddress;
+    bool public isDexPairReversed;
+    
+    // Price deviation limits
+    uint256 public maxPriceDeviation = 0.05e18; // 5% deviation limit
+    
+    // Configuration
+    uint256 public stalePriceThreshold = 3600; // 1 hour
+    uint256 public chainlinkUpdateInterval = 3600; // 1 hour
+    uint256 public lastChainlinkUpdate;
+    
+    // Events
+    event PriceUpdated(uint256 indexed price, uint256 timestamp, PriceSource source);
+    event PriceSourceConfigured(PriceSource source, address indexed feedAddress);
+    event MaxDeviationUpdated(uint256 oldDeviation, uint256 newDeviation);
+    event StaleThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
+
+    /**
+     * @dev Constructor
+     * @param admin Address of the admin
+     * @param _stableCoinUsdPriceFeed Address of the Chainlink price feed for stablecoin/USD
+     * @param _ethUsdPriceFeed Address of the Chainlink price feed for ETH/USD
+     */
+    constructor(
+        address admin,
+        address _stableCoinUsdPriceFeed,
+        address _ethUsdPriceFeed
+    ) {
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(ADMIN_ROLE, admin);
+        _grantRole(ORACLE_UPDATER_ROLE, admin);
+        
+        stableCoinUsdPriceFeed = _stableCoinUsdPriceFeed;
+        ethUsdPriceFeed = _ethUsdPriceFeed;
+        
+        // Initialize with a default price
+        latestPrice = PriceData({
+            price: 1e18, // $1.00
+            timestamp: block.timestamp,
+            source: PriceSource.MANUAL
+        });
+    }
+
+    /**
+     * @dev Set the Chainlink price feed address for stablecoin/USD
+     * @param _priceFeed Address of the Chainlink price feed
+     */
+    function setStableCoinUsdPriceFeed(address _priceFeed) external onlyRole(ADMIN_ROLE) {
+        stableCoinUsdPriceFeed = _priceFeed;
+        emit PriceSourceConfigured(PriceSource.CHAINLINK, _priceFeed);
+    }
+
+    /**
+     * @dev Set the DEX pair address for price data
+     * @param _dexPairAddress Address of the DEX pair contract
+     * @param _isReversed Whether the token order is reversed in the pair
+     */
+    function setDexPairAddress(address _dexPairAddress, bool _isReversed) external onlyRole(ADMIN_ROLE) {
+        dexPairAddress = _dexPairAddress;
+        isDexPairReversed = _isReversed;
+        emit PriceSourceConfigured(PriceSource.DEX, _dexPairAddress);
+    }
+
+    /**
+     * @dev Set the maximum allowed price deviation
+     * @param _maxDeviation New maximum deviation in basis points (scaled by 1e18)
+     */
+    function setMaxPriceDeviation(uint256 _maxDeviation) external onlyRole(ADMIN_ROLE) {
+        require(_maxDeviation <= 0.2e18, "Deviation too high"); // Max 20%
+        uint256 oldDeviation = maxPriceDeviation;
+        maxPriceDeviation = _maxDeviation;
+        emit MaxDeviationUpdated(oldDeviation, _maxDeviation);
+    }
+
+    /**
+     * @dev Set the stale price threshold
+     * @param _threshold New threshold in seconds
+     */
+    function setStalePriceThreshold(uint256 _threshold) external onlyRole(ADMIN_ROLE) {
+        require(_threshold > 0, "Threshold must be positive");
+        uint256 oldThreshold = stalePriceThreshold;
+        stalePriceThreshold = _threshold;
+        emit StaleThresholdUpdated(oldThreshold, _threshold);
+    }
+
+    /**
+     * @dev Manually update the price
+     * @param _price New price value (scaled by 1e18)
+     */
+    function updatePriceManually(uint256 _price) external onlyRole(ORACLE_UPDATER_ROLE) {
+        // Ensure the manual price is within allowed deviation
+        require(isWithinDeviation(_price), "Price outside allowed deviation");
+        
+        latestPrice = PriceData({
+            price: _price,
+            timestamp: block.timestamp,
+            source: PriceSource.MANUAL
+        });
+        
+        emit PriceUpdated(_price, block.timestamp, PriceSource.MANUAL);
+    }
+
+    /**
+     * @dev Update price from Chainlink
+     */
+    function updatePriceFromChainlink() external {
+        require(block.timestamp >= lastChainlinkUpdate + chainlinkUpdateInterval, "Too early for update");
+        require(stableCoinUsdPriceFeed != address(0), "Price feed not configured");
+        
+        uint256 newPrice = getChainlinkPrice();
+        require(isWithinDeviation(newPrice), "Chainlink price outside allowed deviation");
+        
+        latestPrice = PriceData({
+            price: newPrice,
+            timestamp: block.timestamp,
+            source: PriceSource.CHAINLINK
+        });
+        
+        lastChainlinkUpdate = block.timestamp;
+        emit PriceUpdated(newPrice, block.timestamp, PriceSource.CHAINLINK);
+    }
+
+    /**
+     * @dev Update price from DEX
+     */
+    function updatePriceFromDex() external {
+        require(dexPairAddress != address(0), "DEX pair not configured");
+        
+        uint256 newPrice = getDexPrice();
+        require(isWithinDeviation(newPrice), "DEX price outside allowed deviation");
+        
+        latestPrice = PriceData({
+            price: newPrice,
+            timestamp: block.timestamp,
+            source: PriceSource.DEX
+        });
+        
+        emit PriceUpdated(newPrice, block.timestamp, PriceSource.DEX);
+    }
+
+    /**
+     * @dev Get the latest price
+     * @return Current price value (scaled by 1e18)
+     */
+    function getPrice() external view returns (uint256) {
+        require(block.timestamp <= latestPrice.timestamp + stalePriceThreshold, "Price is stale");
+        return latestPrice.price;
+    }
+
+    /**
+     * @dev Get the price from Chainlink
+     * @return Chainlink price value (scaled by 1e18)
+     */
+    function getChainlinkPrice() public view returns (uint256) {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(stableCoinUsdPriceFeed);
+        (
+            ,
+            int256 price,
+            ,
+            uint256 updatedAt,
+            
+        ) = priceFeed.latestRoundData();
+        
+        require(price > 0, "Invalid price");
+        require(block.timestamp <= updatedAt + stalePriceThreshold, "Chainlink price is stale");
+        
+        // Convert to 18 decimals
+        uint8 decimals = priceFeed.decimals();
+        if (decimals < 18) {
+            price = price * int256(10 ** (18 - decimals));
+        } else if (decimals > 18) {
+            price = price / int256(10 ** (decimals - 18));
+        }
+        
+        return uint256(price);
+    }
+
+    /**
+     * @dev Get price from DEX
+     * @return DEX price value (scaled by 1e18)
+     */
+    function getDexPrice() public view returns (uint256) {
+        // This is a simplified implementation that would need to be customized
+        // based on the specific DEX interface (Uniswap V2, V3, etc.)
+        
+        // For Uniswap V2-like interface
+        (uint256 reserve0, uint256 reserve1, ) = IUniswapV2Pair(dexPairAddress).getReserves();
+        
+        uint256 price;
+        if (isDexPairReversed) {
+            price = reserve0.mul(1e18).div(reserve1);
+        } else {
+            price = reserve1.mul(1e18).div(reserve0);
+        }
+        
+        // If the pair is against ETH, convert to USD
+        if (ethUsdPriceFeed != address(0)) {
+            AggregatorV3Interface ethPriceFeed = AggregatorV3Interface(ethUsdPriceFeed);
+            (
+                ,
+                int256 ethPrice,
+                ,
+                ,
+                
+            ) = ethPriceFeed.latestRoundData();
+            
+            require(ethPrice > 0, "Invalid ETH price");
+            
+            // Convert ETH price to 18 decimals
+            uint8 decimals = ethPriceFeed.decimals();
+            if (decimals < 18) {
+                ethPrice = ethPrice * int256(10 ** (18 - decimals));
+            } else if (decimals > 18) {
+                ethPrice = ethPrice / int256(10 ** (decimals - 18));
+            }
+            
+            price = price.mul(uint256(ethPrice)).div(1e18);
+        }
+        
+        return price;
+    }
+
+    /**
+     * @dev Check if a price is within the allowed deviation
+     * @param _price The price to check
+     * @return Whether the price is within allowed deviation
+     */
+    function isWithinDeviation(uint256 _price) public view returns (bool) {
+        if (latestPrice.price == 0) return true;
+        
+        uint256 upperBound = latestPrice.price.mul(1e18 + maxPriceDeviation).div(1e18);
+        uint256 lowerBound = latestPrice.price.mul(1e18 - maxPriceDeviation).div(1e18);
+        
+        return _price <= upperBound && _price >= lowerBound;
+    }
+}
+
+interface IUniswapV2Pair {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+}

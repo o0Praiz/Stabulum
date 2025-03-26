@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+interface IStabulum {
+    function mint(address to, uint256 amount) external;
+    function burn(address from, uint256 amount) external;
+    function balanceOf(address account) external view returns (uint256);
+}
+
+/**
+ * @title StabulumReserveManager
+ * @dev Manages the reserve for the Stabulum stablecoin
+ * Features:
+ * - Tracks reserve status and transactions
+ * - Provides proof of reserve functionality
+ * - Controls minting and burning based on reserve changes
+ */
+contract StabulumReserveManager is 
+    Initializable, 
+    AccessControlUpgradeable, 
+    PausableUpgradeable, 
+    UUPSUpgradeable 
+{
+    // Role definitions
+    bytes32 public constant RESERVE_MANAGER_ROLE = keccak256("RESERVE_MANAGER_ROLE");
+    bytes32 public constant AUDITOR_ROLE = keccak256("AUDITOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    
+    // Address of the Stabulum token contract
+    address public stabulumToken;
+    
+    // Reserve tracking
+    uint256 public totalReserve; // Total amount of collateral in reserve
+    uint256 public totalMinted; // Total amount of Stabulum minted
+    
+    // Reserve transaction types
+    enum TransactionType { DEPOSIT, WITHDRAWAL, AUDIT_ADJUSTMENT }
+    
+    // Reserve transaction record
+    struct ReserveTransaction {
+        uint256 timestamp;
+        TransactionType transactionType;
+        uint256 amount;
+        string description;
+        address executor;
+    }
+    
+    // Audit record
+    struct AuditRecord {
+        uint256 timestamp;
+        address auditor;
+        uint256 reserveAmount;
+        uint256 mintedAmount;
+        string reportURI;
+    }
+    
+    // Array of reserve transactions
+    ReserveTransaction[] public reserveTransactions;
+    
+    // Array of audit records
+    AuditRecord[] public auditRecords;
+    
+    // Events
+    event ReserveDeposited(uint256 amount, string description, address executor);
+    event ReserveWithdrawn(uint256 amount, string description, address executor);
+    event ReserveAdjusted(uint256 amount, bool isIncrease, string description, address executor);
+    event AuditCompleted(uint256 indexed auditId, address auditor, uint256 reserveAmount, string reportURI);
+    event TokensMinted(address to, uint256 amount);
+    event TokensBurned(address from, uint256 amount);
+    
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+    
+    /**
+     * @dev Initializes the contract
+     * @param admin The initial admin address
+     * @param _stabulumToken The address of the Stabulum token contract
+     */
+    function initialize(address admin, address _stabulumToken) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+        
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(RESERVE_MANAGER_ROLE, admin);
+        _grantRole(AUDITOR_ROLE, admin);
+        _grantRole(UPGRADER_ROLE, admin);
+        _grantRole(PAUSER_ROLE, admin);
+        
+        stabulumToken = _stabulumToken;
+        totalReserve = 0;
+        totalMinted = 0;
+    }
+    
+    /**
+     * @dev Records a deposit to the reserve and mints corresponding tokens
+     * @param amount The amount deposited
+     * @param to The address that will receive the minted tokens
+     * @param description Description of the deposit
+     */
+    function depositToReserve(uint256 amount, address to, string memory description) 
+        public 
+        onlyRole(RESERVE_MANAGER_ROLE) 
+        whenNotPaused 
+    {
+        require(amount > 0, "Amount must be greater than zero");
+        
+        totalReserve += amount;
+        totalMinted += amount;
+        
+        // Record the transaction
+        reserveTransactions.push(ReserveTransaction({
+            timestamp: block.timestamp,
+            transactionType: TransactionType.DEPOSIT,
+            amount: amount,
+            description: description,
+            executor: msg.sender
+        }));
+        
+        // Mint new tokens
+        IStabulum(stabulumToken).mint(to, amount);
+        
+        emit ReserveDeposited(amount, description, msg.sender);
+        emit TokensMinted(to, amount);
+    }
+    
+    /**
+     * @dev Records a withdrawal from the reserve and burns corresponding tokens
+     * @param amount The amount withdrawn
+     * @param from The address from which tokens will be burned
+     * @param description Description of the withdrawal
+     */
+    function withdrawFromReserve(uint256 amount, address from, string memory description) 
+        public 
+        onlyRole(RESERVE_MANAGER_ROLE) 
+        whenNotPaused 
+    {
+        require(amount > 0, "Amount must be greater than zero");
+        require(totalReserve >= amount, "Insufficient reserve");
+        require(IStabulum(stabulumToken).balanceOf(from) >= amount, "Insufficient token balance");
+        
+        totalReserve -= amount;
+        totalMinted -= amount;
+        
+        // Record the transaction
+        reserveTransactions.push(ReserveTransaction({
+            timestamp: block.timestamp,
+            transactionType: TransactionType.WITHDRAWAL,
+            amount: amount,
+            description: description,
+            executor: msg.sender
+        }));
+        
+        // Burn tokens
+        IStabulum(stabulumToken).burn(from, amount);
+        
+        emit ReserveWithdrawn(amount, description, msg.sender);
+        emit TokensBurned(from, amount);
+    }
+    
+    /**
+     * @dev Adjusts the reserve based on audit findings
+     * @param newReserveAmount The new reserve amount determined by audit
+     * @param description Description of the adjustment
+     */
+    function adjustReserve(uint256 newReserveAmount, string memory description) 
+        public 
+        onlyRole(AUDITOR_ROLE) 
+    {
+        uint256 oldReserve = totalReserve;
+        totalReserve = newReserveAmount;
+        
+        // Record the transaction
+        reserveTransactions.push(ReserveTransaction({
+            timestamp: block.timestamp,
+            transactionType: TransactionType.AUDIT_ADJUSTMENT,
+            amount: newReserveAmount > oldReserve ? newReserveAmount - oldReserve : oldReserve - newReserveAmount,
+            description: description,
+            executor: msg.sender
+        }));
+        
+        bool isIncrease = newReserveAmount > oldReserve;
+        emit ReserveAdjusted(
+            newReserveAmount > oldReserve ? newReserveAmount - oldReserve : oldReserve - newReserveAmount,
+            isIncrease,
+            description,
+            msg.sender
+        );
+    }
+    
+    /**
+     * @dev Records a formal audit of the reserve
+     * @param reserveAmount The audited reserve amount
+     * @param reportURI URI pointing to the detailed audit report
+     */
+    function recordAudit(uint256 reserveAmount, string memory reportURI) 
+        public 
+        onlyRole(AUDITOR_ROLE) 
+    {
+        auditRecords.push(AuditRecord({
+            timestamp: block.timestamp,
+            auditor: msg.sender,
+            reserveAmount: reserveAmount,
+            mintedAmount: totalMinted,
+            reportURI: reportURI
+        }));
+        
+        // Update the reserve amount based on audit
+        adjustReserve(reserveAmount, "Audit adjustment");
+        
+        emit AuditCompleted(auditRecords.length - 1, msg.sender, reserveAmount, reportURI);
+    }
+    
+    /**
+     * @dev Gets the latest audit record
+     * @return timestamp The timestamp of the latest audit
+     * @return auditor The address of the auditor
+     * @return reserveAmount The audited reserve amount
+     * @return mintedAmount The total minted amount at the time of audit
+     * @return reportURI URI pointing to the detailed audit report
+     */
+    function getLatestAudit() 
+        public 
+        view 
+        returns (
+            uint256 timestamp, 
+            address auditor, 
+            uint256 reserveAmount, 
+            uint256 mintedAmount, 
+            string memory reportURI
+        ) 
+    {
+        require(auditRecords.length > 0, "No audits recorded");
+        
+        AuditRecord memory latest = auditRecords[auditRecords.length - 1];
+        return (
+            latest.timestamp,
+            latest.auditor,
+            latest.reserveAmount,
+            latest.mintedAmount,
+            latest.reportURI
+        );
+    }
+    
+    /**
+     * @dev Gets the reserve status
+     * @return The total reserve amount
+     * @return The total minted amount
+     * @return The reserve ratio (reserve/minted)
+     */
+    function getReserveStatus() 
+        public 
+        view 
+        returns (
+            uint256 reserve, 
+            uint256 minted, 
+            uint256 ratio
+        ) 
+    {
+        uint256 calculatedRatio = totalMinted > 0 ? (totalReserve * 10000) / totalMinted : 0;
+        return (totalReserve, totalMinted, calculatedRatio);
+    }
+    
+    /**
+     * @dev Gets the number of reserve transactions
+     * @return The number of transactions
+     */
+    function getReserveTransactionCount() public view returns (uint256) {
+        return reserveTransactions.length;
+    }
+    
+    /**
+     * @dev Gets the number of audit records
+     * @return The number of audits
+     */
+    function getAuditRecordCount() public view returns (uint256) {
+        return auditRecords.length;
+    }
+    
+    /**
+     * @dev Pauses the contract
+     */
+    function pause() public onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpauses the contract
+     */
+    function unpause() public onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+    
+    /**
+     * @dev Function that should revert when `msg.sender` is not authorized to upgrade the contract
+     * @param newImplementation Address of the new implementation
+     */
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
+}

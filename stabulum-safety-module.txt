@@ -1,0 +1,450 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title StabulumSafetyModule
+ * @dev Contract for providing insurance and stability to the Stabulum stablecoin
+ * Acts as a backstop in case of extreme market conditions or black swan events
+ */
+contract StabulumSafetyModule is AccessControl, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
+    bytes32 public constant SAFETY_ADMIN_ROLE = keccak256("SAFETY_ADMIN_ROLE");
+    bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
+    bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
+
+    // Stabulum token address
+    IERC20 public stabulumToken;
+    
+    // Governance token address
+    IERC20 public governanceToken;
+    
+    // Treasury address
+    address public treasuryAddress;
+    
+    // Oracle address
+    address public oracleAddress;
+    
+    // Insurance fund parameters
+    uint256 public insuranceFundTarget;  // Target size of the insurance fund in USD
+    uint256 public insuranceFundCurrent; // Current size of the insurance fund in USD
+    
+    // Staking parameters
+    uint256 public stakingCooldownPeriod; // Cooldown period for unstaking in seconds
+    uint256 public stakingUnlockPeriod;   // Period during which tokens can be withdrawn after cooldown
+    
+    // Staker information
+    struct StakerInfo {
+        uint256 governanceTokensStaked;   // Amount of governance tokens staked
+        uint256 cooldownStartTimestamp;   // Timestamp when cooldown was initiated
+        uint256 accumulatedRewards;       // Accumulated rewards not yet claimed
+        uint256 lastRewardTimestamp;      // Last time rewards were calculated
+    }
+    
+    // Mapping of staker addresses to their info
+    mapping(address => StakerInfo) public stakers;
+    
+    // Total governance tokens staked
+    uint256 public totalGovernanceTokensStaked;
+    
+    // Insurance fund parameters
+    uint256 public insuranceFundUtilizationRate; // Rate at which the insurance fund can be utilized
+    bool public insuranceFundActivated;          // Flag to indicate if the insurance fund is activated
+    
+    // Events
+    event Staked(address indexed staker, uint256 amount);
+    event CooldownInitiated(address indexed staker, uint256 timestamp);
+    event Unstaked(address indexed staker, uint256 amount);
+    event RewardsClaimed(address indexed staker, uint256 amount);
+    event InsuranceFundActivated(uint256 timestamp);
+    event InsuranceFundDeactivated(uint256 timestamp);
+    event InsuranceFundUtilized(uint256 amount, string reason);
+    event InsuranceFundReplenished(uint256 amount);
+    event InsuranceFundTargetUpdated(uint256 oldTarget, uint256 newTarget);
+    event StakingParametersUpdated(uint256 cooldownPeriod, uint256 unlockPeriod);
+    event TreasuryAddressUpdated(address oldAddress, address newAddress);
+    event OracleAddressUpdated(address oldAddress, address newAddress);
+
+    /**
+     * @dev Constructor initializes the contract with required addresses and parameters
+     * @param _stabulumToken Address of the Stabulum token
+     * @param _governanceToken Address of the governance token
+     * @param _treasuryAddress Address of the treasury
+     * @param _oracleAddress Address of the oracle
+     * @param _insuranceFundTarget Target size of the insurance fund in USD
+     * @param _stakingCooldownPeriod Cooldown period for unstaking in seconds
+     * @param _stakingUnlockPeriod Period during which tokens can be withdrawn after cooldown
+     */
+    constructor(
+        address _stabulumToken,
+        address _governanceToken,
+        address _treasuryAddress,
+        address _oracleAddress,
+        uint256 _insuranceFundTarget,
+        uint256 _stakingCooldownPeriod,
+        uint256 _stakingUnlockPeriod
+    ) {
+        require(_stabulumToken != address(0), "Invalid Stabulum token address");
+        require(_governanceToken != address(0), "Invalid governance token address");
+        require(_treasuryAddress != address(0), "Invalid treasury address");
+        require(_oracleAddress != address(0), "Invalid oracle address");
+        
+        stabulumToken = IERC20(_stabulumToken);
+        governanceToken = IERC20(_governanceToken);
+        treasuryAddress = _treasuryAddress;
+        oracleAddress = _oracleAddress;
+        insuranceFundTarget = _insuranceFundTarget;
+        stakingCooldownPeriod = _stakingCooldownPeriod;
+        stakingUnlockPeriod = _stakingUnlockPeriod;
+        
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(SAFETY_ADMIN_ROLE, msg.sender);
+        _setupRole(GOVERNANCE_ROLE, msg.sender);
+        _setupRole(EMERGENCY_ROLE, msg.sender);
+        
+        insuranceFundUtilizationRate = 5000; // 50% by default
+        insuranceFundActivated = false;
+    }
+    
+    /**
+     * @dev Stake governance tokens to participate in the safety module
+     * @param amount Amount of governance tokens to stake
+     */
+    function stake(uint256 amount) external whenNotPaused nonReentrant {
+        require(amount > 0, "Amount must be greater than zero");
+        
+        // Transfer governance tokens from the user to this contract
+        governanceToken.safeTransferFrom(msg.sender, address(this), amount);
+        
+        // Update staker info
+        StakerInfo storage stakerInfo = stakers[msg.sender];
+        
+        // Update rewards before changing the staking amount
+        updateRewards(msg.sender);
+        
+        // Update staking amount
+        stakerInfo.governanceTokensStaked += amount;
+        totalGovernanceTokensStaked += amount;
+        
+        emit Staked(msg.sender, amount);
+    }
+    
+    /**
+     * @dev Initiate cooldown for unstaking
+     */
+    function initiateCooldown() external whenNotPaused {
+        StakerInfo storage stakerInfo = stakers[msg.sender];
+        require(stakerInfo.governanceTokensStaked > 0, "No tokens staked");
+        
+        // Update rewards before initiating cooldown
+        updateRewards(msg.sender);
+        
+        // Set cooldown timestamp
+        stakerInfo.cooldownStartTimestamp = block.timestamp;
+        
+        emit CooldownInitiated(msg.sender, block.timestamp);
+    }
+    
+    /**
+     * @dev Unstake governance tokens after cooldown period
+     * @param amount Amount of governance tokens to unstake
+     */
+    function unstake(uint256 amount) external whenNotPaused nonReentrant {
+        StakerInfo storage stakerInfo = stakers[msg.sender];
+        require(amount > 0, "Amount must be greater than zero");
+        require(amount <= stakerInfo.governanceTokensStaked, "Insufficient staked amount");
+        
+        // Check if cooldown period has passed
+        require(stakerInfo.cooldownStartTimestamp > 0, "Cooldown not initiated");
+        require(
+            block.timestamp >= stakerInfo.cooldownStartTimestamp + stakingCooldownPeriod,
+            "Cooldown period not passed"
+        );
+        require(
+            block.timestamp <= stakerInfo.cooldownStartTimestamp + stakingCooldownPeriod + stakingUnlockPeriod,
+            "Unstake window expired"
+        );
+        
+        // Update rewards before unstaking
+        updateRewards(msg.sender);
+        
+        // Update staking amount
+        stakerInfo.governanceTokensStaked -= amount;
+        totalGovernanceTokensStaked -= amount;
+        
+        // Reset cooldown if all tokens are unstaked
+        if (stakerInfo.governanceTokensStaked == 0) {
+            stakerInfo.cooldownStartTimestamp = 0;
+        }
+        
+        // Transfer governance tokens back to the user
+        governanceToken.safeTransfer(msg.sender, amount);
+        
+        emit Unstaked(msg.sender, amount);
+    }
+    
+    /**
+     * @dev Update rewards for a staker
+     * @param stakerAddress Address of the staker
+     */
+    function updateRewards(address stakerAddress) internal {
+        StakerInfo storage stakerInfo = stakers[stakerAddress];
+        
+        // Skip if no tokens staked or first stake
+        if (stakerInfo.governanceTokensStaked == 0 || stakerInfo.lastRewardTimestamp == 0) {
+            stakerInfo.lastRewardTimestamp = block.timestamp;
+            return;
+        }
+        
+        // Calculate time elapsed since last reward calculation
+        uint256 timeElapsed = block.timestamp - stakerInfo.lastRewardTimestamp;
+        
+        // Skip if no time has passed
+        if (timeElapsed == 0) return;
+        
+        // Calculate rewards
+        // This is a simplified calculation and should be adjusted based on the actual reward mechanism
+        uint256 rewardRate = 1e15; // 0.1% per day in wei (adjust as needed)
+        uint256 rewardAmount = (stakerInfo.governanceTokensStaked * rewardRate * timeElapsed) / (86400 * 1e18);
+        
+        // Add rewards to accumulated rewards
+        stakerInfo.accumulatedRewards += rewardAmount;
+        
+        // Update last reward timestamp
+        stakerInfo.lastRewardTimestamp = block.timestamp;
+    }
+    
+    /**
+     * @dev Claim accumulated rewards
+     */
+    function claimRewards() external whenNotPaused nonReentrant {
+        StakerInfo storage stakerInfo = stakers[msg.sender];
+        
+        // Update rewards before claiming
+        updateRewards(msg.sender);
+        
+        uint256 rewardsAmount = stakerInfo.accumulatedRewards;
+        require(rewardsAmount > 0, "No rewards to claim");
+        
+        // Reset accumulated rewards
+        stakerInfo.accumulatedRewards = 0;
+        
+        // Transfer rewards to the user
+        // This assumes rewards are in governance tokens
+        // Could be modified to use a different reward token if needed
+        governanceToken.safeTransfer(msg.sender, rewardsAmount);
+        
+        emit RewardsClaimed(msg.sender, rewardsAmount);
+    }
+    
+    /**
+     * @dev Activate the insurance fund in case of emergency
+     */
+    function activateInsuranceFund() external onlyRole(EMERGENCY_ROLE) {
+        require(!insuranceFundActivated, "Insurance fund already activated");
+        
+        insuranceFundActivated = true;
+        
+        emit InsuranceFundActivated(block.timestamp);
+    }
+    
+    /**
+     * @dev Deactivate the insurance fund
+     */
+    function deactivateInsuranceFund() external onlyRole(EMERGENCY_ROLE) {
+        require(insuranceFundActivated, "Insurance fund not activated");
+        
+        insuranceFundActivated = false;
+        
+        emit InsuranceFundDeactivated(block.timestamp);
+    }
+    
+    /**
+     * @dev Utilize the insurance fund to stabilize the stablecoin
+     * @param amount Amount of Stabulum tokens to utilize
+     * @param reason Reason for utilizing the insurance fund
+     */
+    function utilizeInsuranceFund(uint256 amount, string calldata reason) 
+        external 
+        onlyRole(EMERGENCY_ROLE) 
+        nonReentrant 
+    {
+        require(insuranceFundActivated, "Insurance fund not activated");
+        require(amount > 0, "Amount must be greater than zero");
+        
+        // Calculate the maximum amount that can be utilized
+        uint256 maxUtilization = (insuranceFundCurrent * insuranceFundUtilizationRate) / 10000;
+        require(amount <= maxUtilization, "Amount exceeds maximum utilization");
+        
+        // Update insurance fund size
+        insuranceFundCurrent -= amount;
+        
+        // Transfer Stabulum tokens to the treasury
+        stabulumToken.safeTransfer(treasuryAddress, amount);
+        
+        emit InsuranceFundUtilized(amount, reason);
+    }
+    
+    /**
+     * @dev Replenish the insurance fund
+     * @param amount Amount of Stabulum tokens to add to the insurance fund
+     */
+    function replenishInsuranceFund(uint256 amount) external onlyRole(SAFETY_ADMIN_ROLE) nonReentrant {
+        require(amount > 0, "Amount must be greater than zero");
+        
+        // Transfer Stabulum tokens from the sender to this contract
+        stabulumToken.safeTransferFrom(msg.sender, address(this), amount);
+        
+        // Update insurance fund size
+        insuranceFundCurrent += amount;
+        
+        emit InsuranceFundReplenished(amount);
+    }
+    
+    /**
+     * @dev Update the insurance fund target
+     * @param newTarget New target size of the insurance fund
+     */
+    function updateInsuranceFundTarget(uint256 newTarget) external onlyRole(GOVERNANCE_ROLE) {
+        require(newTarget > 0, "Target must be greater than zero");
+        
+        uint256 oldTarget = insuranceFundTarget;
+        insuranceFundTarget = newTarget;
+        
+        emit InsuranceFundTargetUpdated(oldTarget, newTarget);
+    }
+    
+    /**
+     * @dev Update the insurance fund utilization rate
+     * @param newRate New utilization rate in basis points (10000 = 100%)
+     */
+    function updateInsuranceFundUtilizationRate(uint256 newRate) external onlyRole(GOVERNANCE_ROLE) {
+        require(newRate <= 10000, "Rate cannot exceed 100%");
+        
+        insuranceFundUtilizationRate = newRate;
+    }
+    
+    /**
+     * @dev Update staking parameters
+     * @param newCooldownPeriod New cooldown period in seconds
+     * @param newUnlockPeriod New unlock period in seconds
+     */
+    function updateStakingParameters(uint256 newCooldownPeriod, uint256 newUnlockPeriod) 
+        external 
+        onlyRole(GOVERNANCE_ROLE) 
+    {
+        stakingCooldownPeriod = newCooldownPeriod;
+        stakingUnlockPeriod = newUnlockPeriod;
+        
+        emit StakingParametersUpdated(newCooldownPeriod, newUnlockPeriod);
+    }
+    
+    /**
+     * @dev Update the treasury address
+     * @param newTreasuryAddress New treasury address
+     */
+    function updateTreasuryAddress(address newTreasuryAddress) external onlyRole(GOVERNANCE_ROLE) {
+        require(newTreasuryAddress != address(0), "Invalid treasury address");
+        
+        address oldTreasuryAddress = treasuryAddress;
+        treasuryAddress = newTreasuryAddress;
+        
+        emit TreasuryAddressUpdated(oldTreasuryAddress, newTreasuryAddress);
+    }
+    
+    /**
+     * @dev Update the oracle address
+     * @param newOracleAddress New oracle address
+     */
+    function updateOracleAddress(address newOracleAddress) external onlyRole(GOVERNANCE_ROLE) {
+        require(newOracleAddress != address(0), "Invalid oracle address");
+        
+        address oldOracleAddress = oracleAddress;
+        oracleAddress = newOracleAddress;
+        
+        emit OracleAddressUpdated(oldOracleAddress, newOracleAddress);
+    }
+    
+    /**
+     * @dev Get the staking information for a staker
+     * @param stakerAddress Address of the staker
+     * @return stakedAmount Amount of governance tokens staked
+     * @return cooldownTimestamp Timestamp when cooldown was initiated
+     * @return accumulatedRewards Accumulated rewards not yet claimed
+     */
+    function getStakerInfo(address stakerAddress) 
+        external 
+        view 
+        returns (
+            uint256 stakedAmount, 
+            uint256 cooldownTimestamp, 
+            uint256 accumulatedRewards
+        ) 
+    {
+        StakerInfo storage stakerInfo = stakers[stakerAddress];
+        
+        return (
+            stakerInfo.governanceTokensStaked,
+            stakerInfo.cooldownStartTimestamp,
+            stakerInfo.accumulatedRewards
+        );
+    }
+    
+    /**
+     * @dev Get the current funding ratio of the insurance fund
+     * @return The current funding ratio in basis points (10000 = 100%)
+     */
+    function getInsuranceFundRatio() external view returns (uint256) {
+        if (insuranceFundTarget == 0) return 0;
+        return (insuranceFundCurrent * 10000) / insuranceFundTarget;
+    }
+    
+    /**
+     * @dev Pause the contract
+     */
+    function pause() external onlyRole(SAFETY_ADMIN_ROLE) {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpause the contract
+     */
+    function unpause() external onlyRole(SAFETY_ADMIN_ROLE) {
+        _unpause();
+    }
+    
+    /**
+     * @dev Emergency function to recover tokens accidentally sent to the contract
+     * @param tokenAddress Address of the token to recover
+     * @param amount Amount to recover
+     * @param recipient Address to send the recovered tokens to
+     */
+    function recoverTokens(
+        address tokenAddress, 
+        uint256 amount, 
+        address recipient
+    ) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        // Prevent recovering staked tokens
+        if (tokenAddress == address(governanceToken)) {
+            require(amount <= governanceToken.balanceOf(address(this)) - totalGovernanceTokensStaked,
+                "Cannot recover staked tokens");
+        }
+        
+        // Prevent recovering insurance fund tokens
+        if (tokenAddress == address(stabulumToken)) {
+            require(amount <= stabulumToken.balanceOf(address(this)) - insuranceFundCurrent,
+                "Cannot recover insurance fund tokens");
+        }
+        
+        IERC20(tokenAddress).safeTransfer(recipient, amount);
+    }
+}

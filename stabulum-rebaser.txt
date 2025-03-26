@@ -1,0 +1,292 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/**
+ * @title StabulumRebaser
+ * @dev Contract to manage rebasing functionality for algorithmically maintaining the peg
+ */
+contract StabulumRebaser is AccessControl {
+    using SafeMath for uint256;
+
+    bytes32 public constant REBASER_ROLE = keccak256("REBASER_ROLE");
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+    
+    // The Stabulum token address
+    address public stabulumToken;
+    
+    // The oracle contract address
+    address public oracleAddress;
+    
+    // Target price in USD with 18 decimals (1.00 USD = 1e18)
+    uint256 public targetPrice = 1e18;
+    
+    // Rebase parameters
+    uint256 public rebaseThresholdUp = 1.01e18;   // 1% above target
+    uint256 public rebaseThresholdDown = 0.99e18; // 1% below target
+    uint256 public rebaseLag = 10;                // Smooth out rebases over 10 periods
+    
+    // Rebase limits
+    uint256 public maxRebaseUp = 1.1e18;   // Max 10% upward rebase
+    uint256 public maxRebaseDown = 0.9e18; // Max 10% downward rebase
+    
+    // Rebase time parameters
+    uint256 public rebaseInterval = 24 hours;
+    uint256 public lastRebaseTime = 0;
+    bool public rebaseActive = false;
+    
+    // Events
+    event PriceUpdated(uint256 price);
+    event RebaseScheduled(uint256 indexed timestamp, uint256 price);
+    event RebaseExecuted(
+        uint256 indexed timestamp, 
+        uint256 price, 
+        int256 supplyDelta, 
+        uint256 oldSupply, 
+        uint256 newSupply
+    );
+    event RebaseParametersUpdated(
+        uint256 rebaseThresholdUp,
+        uint256 rebaseThresholdDown,
+        uint256 rebaseLag
+    );
+    event RebaseLimitsUpdated(
+        uint256 maxRebaseUp,
+        uint256 maxRebaseDown
+    );
+    event RebaseToggled(bool active);
+    event RebaseIntervalUpdated(uint256 interval);
+    event OracleUpdated(address indexed oldOracle, address indexed newOracle);
+
+    /**
+     * @dev Constructor
+     * @param admin Address of the admin
+     * @param _stabulumToken Address of the Stabulum token
+     * @param _oracleAddress Address of the price oracle
+     */
+    constructor(
+        address admin, 
+        address _stabulumToken, 
+        address _oracleAddress
+    ) {
+        require(_stabulumToken != address(0), "Invalid token address");
+        require(_oracleAddress != address(0), "Invalid oracle address");
+        
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(REBASER_ROLE, admin);
+        
+        stabulumToken = _stabulumToken;
+        oracleAddress = _oracleAddress;
+    }
+
+    /**
+     * @dev Set the oracle address
+     * @param _oracleAddress Address of the new oracle
+     */
+    function setOracle(address _oracleAddress) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_oracleAddress != address(0), "Invalid oracle address");
+        address oldOracle = oracleAddress;
+        oracleAddress = _oracleAddress;
+        emit OracleUpdated(oldOracle, _oracleAddress);
+    }
+
+    /**
+     * @dev Set the rebase parameters
+     * @param _rebaseThresholdUp New upper threshold for rebase trigger
+     * @param _rebaseThresholdDown New lower threshold for rebase trigger
+     * @param _rebaseLag New rebase lag factor
+     */
+    function setRebaseParameters(
+        uint256 _rebaseThresholdUp,
+        uint256 _rebaseThresholdDown,
+        uint256 _rebaseLag
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_rebaseThresholdUp > targetPrice, "Upper threshold must be above target");
+        require(_rebaseThresholdDown < targetPrice, "Lower threshold must be below target");
+        require(_rebaseLag > 0, "Rebase lag must be positive");
+        
+        rebaseThresholdUp = _rebaseThresholdUp;
+        rebaseThresholdDown = _rebaseThresholdDown;
+        rebaseLag = _rebaseLag;
+        
+        emit RebaseParametersUpdated(_rebaseThresholdUp, _rebaseThresholdDown, _rebaseLag);
+    }
+
+    /**
+     * @dev Set the rebase limits
+     * @param _maxRebaseUp New maximum upward rebase ratio
+     * @param _maxRebaseDown New maximum downward rebase ratio
+     */
+    function setRebaseLimits(
+        uint256 _maxRebaseUp,
+        uint256 _maxRebaseDown
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_maxRebaseUp > targetPrice, "Max rebase up must be above target");
+        require(_maxRebaseDown < targetPrice, "Max rebase down must be below target");
+        
+        maxRebaseUp = _maxRebaseUp;
+        maxRebaseDown = _maxRebaseDown;
+        
+        emit RebaseLimitsUpdated(_maxRebaseUp, _maxRebaseDown);
+    }
+
+    /**
+     * @dev Set the rebase interval
+     * @param _interval New rebase interval in seconds
+     */
+    function setRebaseInterval(uint256 _interval) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_interval > 0, "Interval must be positive");
+        rebaseInterval = _interval;
+        emit RebaseIntervalUpdated(_interval);
+    }
+
+    /**
+     * @dev Toggle the rebase functionality
+     * @param _active New active state
+     */
+    function toggleRebase(bool _active) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        rebaseActive = _active;
+        emit RebaseToggled(_active);
+    }
+
+    /**
+     * @dev Get the current price from the oracle
+     * @return Current price from oracle
+     */
+    function getCurrentPrice() public view returns (uint256) {
+        // Interface for oracle contract
+        (bool success, bytes memory data) = oracleAddress.staticcall(
+            abi.encodeWithSignature("getPrice()")
+        );
+
+        require(success && data.length >= 32, "Oracle price fetch failed");
+        return abi.decode(data, (uint256));
+    }
+
+    /**
+     * @dev Schedule a rebase operation
+     */
+    function scheduleRebase() external onlyRole(REBASER_ROLE) {
+        require(rebaseActive, "Rebase is not active");
+        require(block.timestamp >= lastRebaseTime + rebaseInterval, "Too early for next rebase");
+        
+        uint256 currentPrice = getCurrentPrice();
+        emit RebaseScheduled(block.timestamp, currentPrice);
+        
+        // Execute rebase immediately
+        executeRebase(currentPrice);
+    }
+
+    /**
+     * @dev Execute a rebase operation
+     * @param currentPrice Current price of the token
+     */
+    function executeRebase(uint256 currentPrice) internal {
+        lastRebaseTime = block.timestamp;
+        
+        // Skip if price is within thresholds
+        if (currentPrice <= rebaseThresholdUp && currentPrice >= rebaseThresholdDown) {
+            return; // No rebase needed
+        }
+        
+        // Calculate supply delta
+        uint256 totalSupply = IERC20(stabulumToken).totalSupply();
+        int256 supplyDelta = computeSupplyDelta(currentPrice, totalSupply);
+        
+        // Apply rebase lag
+        supplyDelta = supplyDelta / int256(rebaseLag);
+        
+        // Apply rebase limits
+        supplyDelta = limitRebase(supplyDelta, totalSupply);
+        
+        // Execute rebase through token contract
+        uint256 newSupply;
+        if (supplyDelta > 0) {
+            // Mint new tokens
+            newSupply = totalSupply + uint256(supplyDelta);
+            callTokenRebase(uint256(supplyDelta), true);
+        } else if (supplyDelta < 0) {
+            // Burn tokens
+            newSupply = totalSupply - uint256(-supplyDelta);
+            callTokenRebase(uint256(-supplyDelta), false);
+        } else {
+            newSupply = totalSupply;
+        }
+        
+        emit RebaseExecuted(
+            block.timestamp,
+            currentPrice,
+            supplyDelta,
+            totalSupply,
+            newSupply
+        );
+    }
+
+    /**
+     * @dev Compute the supply delta based on current price
+     * @param currentPrice Current price from oracle
+     * @param totalSupply Current total supply
+     * @return Supply delta (positive for mint, negative for burn)
+     */
+    function computeSupplyDelta(uint256 currentPrice, uint256 totalSupply) public view returns (int256) {
+        if (currentPrice > targetPrice) {
+            // Price is above target, need to increase supply
+            uint256 priceRatio = currentPrice.mul(1e18).div(targetPrice);
+            return int256(totalSupply.mul(priceRatio.sub(1e18)).div(1e18));
+        } else if (currentPrice < targetPrice) {
+            // Price is below target, need to decrease supply
+            uint256 priceRatio = targetPrice.mul(1e18).div(currentPrice);
+            return -int256(totalSupply.mul(priceRatio.sub(1e18)).div(1e18));
+        } else {
+            return 0; // No change needed
+        }
+    }
+
+    /**
+     * @dev Limit the rebase amount to the configured max
+     * @param supplyDelta Calculated supply delta
+     * @param totalSupply Current total supply
+     * @return Limited supply delta
+     */
+    function limitRebase(int256 supplyDelta, uint256 totalSupply) public view returns (int256) {
+        if (supplyDelta > 0) {
+            uint256 maxDelta = totalSupply.mul(maxRebaseUp.sub(1e18)).div(1e18);
+            if (uint256(supplyDelta) > maxDelta) {
+                return int256(maxDelta);
+            }
+        } else if (supplyDelta < 0) {
+            uint256 maxDelta = totalSupply.mul(1e18.sub(maxRebaseDown)).div(1e18);
+            if (uint256(-supplyDelta) > maxDelta) {
+                return -int256(maxDelta);
+            }
+        }
+        return supplyDelta;
+    }
+
+    /**
+     * @dev Call the token contract to execute a rebase
+     * @param amount Amount of tokens to mint or burn
+     * @param isMint True for mint, false for burn
+     */
+    function callTokenRebase(uint256 amount, bool isMint) internal {
+        if (isMint) {
+            // Interface for token mint function
+            (bool success, ) = stabulumToken.call(
+                abi.encodeWithSignature("mint(address,uint256)", address(this), amount)
+            );
+            require(success, "Token mint failed");
+            
+            // Transfer the newly minted tokens to the treasury
+            IERC20(stabulumToken).transfer(msg.sender, amount);
+        } else {
+            // Interface for token burn function
+            (bool success, ) = stabulumToken.call(
+                abi.encodeWithSignature("burn(uint256)", amount)
+            );
+            require(success, "Token burn failed");
+        }
+    }
+}

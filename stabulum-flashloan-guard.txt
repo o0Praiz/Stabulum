@@ -1,0 +1,211 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/**
+ * @title StabulumFlashLoanGuard
+ * @dev Contract to protect against flash loan attacks
+ */
+contract StabulumFlashLoanGuard is AccessControl {
+    bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
+    
+    // Configuration
+    uint256 public maxTxAmount;
+    uint256 public maxSingleWalletAmount;
+    uint256 public maxTradingVolume;
+    uint256 public volumeTimeWindow;
+    
+    // State variables
+    mapping(address => uint256) public lastTxTimestamp;
+    mapping(address => uint256) public txCount;
+    mapping(address => uint256) public tradingVolume;
+    
+    // Excluded addresses
+    mapping(address => bool) public isExcluded;
+    
+    // Protected contracts
+    address[] public protectedContracts;
+    
+    // Events
+    event ProtectionTriggered(address indexed account, string reason);
+    event ProtectionConfigUpdated(
+        uint256 maxTxAmount,
+        uint256 maxSingleWalletAmount,
+        uint256 maxTradingVolume,
+        uint256 volumeTimeWindow
+    );
+    event AddressExcluded(address indexed account, bool excluded);
+    event ProtectedContractAdded(address indexed contractAddress);
+    event ProtectedContractRemoved(address indexed contractAddress);
+
+    /**
+     * @dev Constructor
+     * @param admin Address of the admin
+     * @param _maxTxAmount Maximum transaction amount
+     * @param _maxSingleWalletAmount Maximum single wallet amount
+     * @param _maxTradingVolume Maximum trading volume in time window
+     * @param _volumeTimeWindow Time window for volume calculation
+     */
+    constructor(
+        address admin,
+        uint256 _maxTxAmount,
+        uint256 _maxSingleWalletAmount,
+        uint256 _maxTradingVolume,
+        uint256 _volumeTimeWindow
+    ) {
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(MANAGER_ROLE, admin);
+        
+        maxTxAmount = _maxTxAmount;
+        maxSingleWalletAmount = _maxSingleWalletAmount;
+        maxTradingVolume = _maxTradingVolume;
+        volumeTimeWindow = _volumeTimeWindow;
+    }
+
+    /**
+     * @dev Set the protection configuration
+     * @param _maxTxAmount New maximum transaction amount
+     * @param _maxSingleWalletAmount New maximum single wallet amount
+     * @param _maxTradingVolume New maximum trading volume
+     * @param _volumeTimeWindow New time window for volume calculation
+     */
+    function setProtectionConfig(
+        uint256 _maxTxAmount,
+        uint256 _maxSingleWalletAmount,
+        uint256 _maxTradingVolume,
+        uint256 _volumeTimeWindow
+    ) external onlyRole(MANAGER_ROLE) {
+        maxTxAmount = _maxTxAmount;
+        maxSingleWalletAmount = _maxSingleWalletAmount;
+        maxTradingVolume = _maxTradingVolume;
+        volumeTimeWindow = _volumeTimeWindow;
+        
+        emit ProtectionConfigUpdated(
+            _maxTxAmount,
+            _maxSingleWalletAmount,
+            _maxTradingVolume,
+            _volumeTimeWindow
+        );
+    }
+
+    /**
+     * @dev Add an address to exclusion list
+     * @param account Address to exclude
+     * @param excluded Whether to exclude or include
+     */
+    function setExcluded(address account, bool excluded) external onlyRole(MANAGER_ROLE) {
+        isExcluded[account] = excluded;
+        emit AddressExcluded(account, excluded);
+    }
+
+    /**
+     * @dev Add a contract to the protected list
+     * @param contractAddress Address of the contract to protect
+     */
+    function addProtectedContract(address contractAddress) external onlyRole(MANAGER_ROLE) {
+        for (uint256 i = 0; i < protectedContracts.length; i++) {
+            require(protectedContracts[i] != contractAddress, "Contract already protected");
+        }
+        protectedContracts.push(contractAddress);
+        emit ProtectedContractAdded(contractAddress);
+    }
+
+    /**
+     * @dev Remove a contract from the protected list
+     * @param contractAddress Address of the contract to remove
+     */
+    function removeProtectedContract(address contractAddress) external onlyRole(MANAGER_ROLE) {
+        for (uint256 i = 0; i < protectedContracts.length; i++) {
+            if (protectedContracts[i] == contractAddress) {
+                protectedContracts[i] = protectedContracts[protectedContracts.length - 1];
+                protectedContracts.pop();
+                emit ProtectedContractRemoved(contractAddress);
+                return;
+            }
+        }
+        revert("Contract not found");
+    }
+
+    /**
+     * @dev Check if a transaction is allowed
+     * @param from Sender address
+     * @param to Recipient address
+     * @param amount Transaction amount
+     * @return Whether the transaction is allowed
+     */
+    function checkTransaction(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool) {
+        // Skip checks for excluded addresses
+        if (isExcluded[from] || isExcluded[to]) {
+            return true;
+        }
+        
+        // Check maximum transaction amount
+        if (amount > maxTxAmount) {
+            emit ProtectionTriggered(from, "Transaction exceeds max amount");
+            return false;
+        }
+        
+        // Check maximum single wallet amount (only for receiving)
+        address stabulumToken = protectedContracts[0];
+        uint256 newBalance = IERC20(stabulumToken).balanceOf(to) + amount;
+        if (newBalance > maxSingleWalletAmount) {
+            emit ProtectionTriggered(to, "Balance exceeds max wallet amount");
+            return false;
+        }
+        
+        // Check trading volume
+        uint256 currentTime = block.timestamp;
+        if (currentTime > lastTxTimestamp[from] + volumeTimeWindow) {
+            // Reset volume if time window has passed
+            tradingVolume[from] = amount;
+        } else {
+            // Add to volume if within time window
+            tradingVolume[from] += amount;
+            if (tradingVolume[from] > maxTradingVolume) {
+                emit ProtectionTriggered(from, "Trading volume exceeds max");
+                return false;
+            }
+        }
+        
+        // Update last transaction timestamp
+        lastTxTimestamp[from] = currentTime;
+        
+        // Increment transaction count
+        txCount[from]++;
+        
+        return true;
+    }
+
+    /**
+     * @dev Get the list of protected contracts
+     * @return List of protected contract addresses
+     */
+    function getProtectedContracts() external view returns (address[] memory) {
+        return protectedContracts;
+    }
+
+    /**
+     * @dev Get trading statistics for an address
+     * @param account Address to check
+     * @return lastTx Last transaction timestamp
+     * @return count Transaction count
+     * @return volume Current trading volume
+     */
+    function getTradingStats(address account) external view returns (
+        uint256 lastTx,
+        uint256 count,
+        uint256 volume
+    ) {
+        return (
+            lastTxTimestamp[account],
+            txCount[account],
+            tradingVolume[account]
+        );
+    }
+}

@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+
+/**
+ * @title StabulumReserveAudit
+ * @dev Contract to manage and verify reserve audits for the Stabulum stablecoin
+ */
+contract StabulumReserveAudit is AccessControl {
+    using ECDSA for bytes32;
+
+    bytes32 public constant AUDITOR_ROLE = keccak256("AUDITOR_ROLE");
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+
+    struct AuditReport {
+        uint256 timestamp;
+        string reportURI;
+        string reportHash; // IPFS hash or other content-addressing identifier
+        uint256 totalReserve;
+        uint256 totalSupply;
+        address auditor;
+        bool verified;
+    }
+
+    // Array to store all audit reports
+    AuditReport[] public auditReports;
+    
+    // Mapping from trusted auditors to their signer addresses
+    mapping(address => address) public auditorSigners;
+    
+    // Attestation requirements
+    uint256 public requiredAttestations;
+    mapping(uint256 => mapping(address => bool)) public reportAttestations;
+    mapping(uint256 => uint256) public reportAttestationCount;
+
+    // Events
+    event AuditReportSubmitted(uint256 indexed reportId, address indexed auditor, uint256 timestamp);
+    event AuditReportAttested(uint256 indexed reportId, address indexed attestor);
+    event AuditReportVerified(uint256 indexed reportId);
+    event AuditorSignerUpdated(address indexed auditor, address indexed signerAddress);
+    event RequiredAttestationsUpdated(uint256 previousValue, uint256 newValue);
+
+    /**
+     * @dev Constructor
+     * @param admin Address of the admin
+     */
+    constructor(address admin) {
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(ADMIN_ROLE, admin);
+        requiredAttestations = 1; // Default to 1 attestation required
+    }
+
+    /**
+     * @dev Add an auditor
+     * @param auditor Address of the auditor
+     * @param signerAddress Address used by the auditor for signing reports
+     */
+    function addAuditor(address auditor, address signerAddress) external onlyRole(ADMIN_ROLE) {
+        _grantRole(AUDITOR_ROLE, auditor);
+        auditorSigners[auditor] = signerAddress;
+        emit AuditorSignerUpdated(auditor, signerAddress);
+    }
+
+    /**
+     * @dev Remove an auditor
+     * @param auditor Address of the auditor to remove
+     */
+    function removeAuditor(address auditor) external onlyRole(ADMIN_ROLE) {
+        _revokeRole(AUDITOR_ROLE, auditor);
+    }
+
+    /**
+     * @dev Update the signer address for an auditor
+     * @param auditor Address of the auditor
+     * @param signerAddress New signer address
+     */
+    function updateAuditorSigner(address auditor, address signerAddress) external onlyRole(ADMIN_ROLE) {
+        require(hasRole(AUDITOR_ROLE, auditor), "Address is not an auditor");
+        auditorSigners[auditor] = signerAddress;
+        emit AuditorSignerUpdated(auditor, signerAddress);
+    }
+
+    /**
+     * @dev Set the required number of attestations for a report to be verified
+     * @param count Number of required attestations
+     */
+    function setRequiredAttestations(uint256 count) external onlyRole(ADMIN_ROLE) {
+        require(count > 0, "Required attestations must be greater than 0");
+        uint256 previous = requiredAttestations;
+        requiredAttestations = count;
+        emit RequiredAttestationsUpdated(previous, count);
+    }
+
+    /**
+     * @dev Submit a new audit report
+     * @param reportURI URI pointing to the detailed audit report
+     * @param reportHash Hash of the audit report for verification
+     * @param totalReserve Total value of reserves in base currency units
+     * @param totalSupply Total supply of the stablecoin at the time of audit
+     * @param signature Cryptographic signature of the auditor
+     */
+    function submitAuditReport(
+        string calldata reportURI,
+        string calldata reportHash,
+        uint256 totalReserve,
+        uint256 totalSupply,
+        bytes calldata signature
+    ) external onlyRole(AUDITOR_ROLE) {
+        // Create message hash
+        bytes32 messageHash = keccak256(
+            abi.encodePacked(
+                reportURI,
+                reportHash,
+                totalReserve,
+                totalSupply,
+                block.timestamp
+            )
+        );
+        
+        // Verify signature
+        bytes32 ethSignedMessageHash = messageHash.toEthSignedMessageHash();
+        address signer = ethSignedMessageHash.recover(signature);
+        
+        require(signer == auditorSigners[msg.sender], "Invalid signature");
+        
+        // Create and store the report
+        uint256 reportId = auditReports.length;
+        auditReports.push(
+            AuditReport({
+                timestamp: block.timestamp,
+                reportURI: reportURI,
+                reportHash: reportHash,
+                totalReserve: totalReserve,
+                totalSupply: totalSupply,
+                auditor: msg.sender,
+                verified: false
+            })
+        );
+        
+        // Auto-attest by the submitter
+        _attestReport(reportId, msg.sender);
+        
+        emit AuditReportSubmitted(reportId, msg.sender, block.timestamp);
+        
+        // If only one attestation required, verify immediately
+        if (reportAttestationCount[reportId] >= requiredAttestations) {
+            auditReports[reportId].verified = true;
+            emit AuditReportVerified(reportId);
+        }
+    }
+
+    /**
+     * @dev Attest to an existing audit report
+     * @param reportId ID of the report to attest
+     */
+    function attestReport(uint256 reportId) external onlyRole(AUDITOR_ROLE) {
+        require(reportId < auditReports.length, "Report does not exist");
+        require(!auditReports[reportId].verified, "Report already verified");
+        require(msg.sender != auditReports[reportId].auditor, "Cannot attest own report twice");
+        
+        _attestReport(reportId, msg.sender);
+        
+        // Check if report should be verified after this attestation
+        if (reportAttestationCount[reportId] >= requiredAttestations) {
+            auditReports[reportId].verified = true;
+            emit AuditReportVerified(reportId);
+        }
+    }
+
+    /**
+     * @dev Internal function to handle attestation logic
+     * @param reportId Report ID
+     * @param attestor Address of the attestor
+     */
+    function _attestReport(uint256 reportId, address attestor) internal {
+        require(!reportAttestations[reportId][attestor], "Already attested by this auditor");
+        
+        reportAttestations[reportId][attestor] = true;
+        reportAttestationCount[reportId] += 1;
+        
+        emit AuditReportAttested(reportId, attestor);
+    }
+
+    /**
+     * @dev Get the latest verified audit report
+     * @return reportId ID of the latest verified report
+     * @return timestamp Time when the report was submitted
+     * @return reportURI URI of the detailed report
+     * @return reportHash Hash of the report
+     * @return totalReserve Total reserves reported
+     * @return totalSupply Total supply at the time of the report
+     * @return collateralizationRatio Ratio of reserves to supply (scaled by 1e6)
+     */
+    function getLatestVerifiedReport() external view returns (
+        uint256 reportId,
+        uint256 timestamp,
+        string memory reportURI,
+        string memory reportHash,
+        uint256 totalReserve,
+        uint256 totalSupply,
+        uint256 collateralizationRatio
+    ) {
+        for (uint256 i = auditReports.length; i > 0; i--) {
+            uint256 index = i - 1;
+            if (auditReports[index].verified) {
+                AuditReport storage report = auditReports[index];
+                // Calculate collateralization ratio with 6 decimal precision
+                uint256 ratio = 0;
+                if (report.totalSupply > 0) {
+                    ratio = (report.totalReserve * 1e6) / report.totalSupply;
+                }
+                
+                return (
+                    index,
+                    report.timestamp,
+                    report.reportURI,
+                    report.reportHash,
+                    report.totalReserve,
+                    report.totalSupply,
+                    ratio
+                );
+            }
+        }
+        
+        revert("No verified reports found");
+    }
+
+    /**
+     * @dev Get the total number of audit reports
+     * @return Count of all audit reports
+     */
+    function getAuditReportCount() external view returns (uint256) {
+        return auditReports.length;
+    }
+
+    /**
+     * @dev Check if a report has been attested by a specific auditor
+     * @param reportId ID of the report
+     * @param auditor Address of the auditor
+     * @return Whether the report has been attested by the auditor
+     */
+    function hasAttested(uint256 reportId, address auditor) external view returns (bool) {
+        return reportAttestations[reportId][auditor];
+    }
+}

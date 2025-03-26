@@ -1,0 +1,410 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title StabulumTreasuryManagement
+ * @dev Contract for managing the Stabulum treasury, including reserve assets
+ * This contract handles the collateral backing the Stabulum stablecoin
+ */
+contract StabulumTreasuryManagement is AccessControl, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
+    bytes32 public constant TREASURY_MANAGER_ROLE = keccak256("TREASURY_MANAGER_ROLE");
+    bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
+    bytes32 public constant RESERVE_MANAGER_ROLE = keccak256("RESERVE_MANAGER_ROLE");
+
+    // Stabulum token address
+    IERC20 public stabulumToken;
+    
+    // Supported collateral tokens with their configurations
+    struct CollateralToken {
+        address tokenAddress;
+        uint256 collateralRatio;  // Ratio in basis points (10000 = 100%)
+        uint256 liquidationThreshold;  // Threshold in basis points
+        bool isActive;
+        uint256 maxAllocation;  // Maximum percentage of total collateral in basis points
+        uint256 totalCollateral;  // Total amount of this collateral token
+    }
+    
+    // Mapping of collateral token addresses to their configurations
+    mapping(address => CollateralToken) public collateralTokens;
+    // List of supported collateral token addresses
+    address[] public supportedCollateralTokens;
+    
+    // Total value of all collateral (in USD, scaled by 1e18)
+    uint256 public totalCollateralValue;
+    // Total supply of Stabulum that should be backed by collateral
+    uint256 public totalStabulumSupply;
+    
+    // Oracle address for price feeds
+    address public oracleAddress;
+    
+    // Events
+    event CollateralAdded(address indexed token, uint256 amount, uint256 value);
+    event CollateralRemoved(address indexed token, uint256 amount, uint256 value);
+    event CollateralTokenUpdated(address indexed token, uint256 collateralRatio, uint256 liquidationThreshold, bool isActive, uint256 maxAllocation);
+    event CollateralTokenAdded(address indexed token, uint256 collateralRatio, uint256 liquidationThreshold, uint256 maxAllocation);
+    event CollateralTokenRemoved(address indexed token);
+    event OracleUpdated(address indexed oldOracle, address indexed newOracle);
+    event ReserveAuditCompleted(uint256 timestamp, uint256 totalCollateralValue, uint256 totalStabulumSupply);
+
+    /**
+     * @dev Constructor initializes the contract with required addresses
+     * @param _stabulumToken Address of the Stabulum token
+     * @param _oracleAddress Address of the price oracle
+     * @param _initialCollateralTokens Array of initial collateral token addresses
+     * @param _initialCollateralRatios Array of initial collateral ratios
+     * @param _initialLiquidationThresholds Array of initial liquidation thresholds
+     * @param _initialMaxAllocations Array of initial max allocations
+     */
+    constructor(
+        address _stabulumToken,
+        address _oracleAddress,
+        address[] memory _initialCollateralTokens,
+        uint256[] memory _initialCollateralRatios,
+        uint256[] memory _initialLiquidationThresholds,
+        uint256[] memory _initialMaxAllocations
+    ) {
+        require(_stabulumToken != address(0), "Invalid Stabulum token address");
+        require(_oracleAddress != address(0), "Invalid oracle address");
+        require(
+            _initialCollateralTokens.length == _initialCollateralRatios.length &&
+            _initialCollateralTokens.length == _initialLiquidationThresholds.length &&
+            _initialCollateralTokens.length == _initialMaxAllocations.length,
+            "Arrays length mismatch"
+        );
+        
+        stabulumToken = IERC20(_stabulumToken);
+        oracleAddress = _oracleAddress;
+        
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(TREASURY_MANAGER_ROLE, msg.sender);
+        _setupRole(GOVERNANCE_ROLE, msg.sender);
+        _setupRole(RESERVE_MANAGER_ROLE, msg.sender);
+        
+        // Add initial collateral tokens
+        for (uint256 i = 0; i < _initialCollateralTokens.length; i++) {
+            _addCollateralToken(
+                _initialCollateralTokens[i],
+                _initialCollateralRatios[i],
+                _initialLiquidationThresholds[i],
+                _initialMaxAllocations[i]
+            );
+        }
+    }
+    
+    /**
+     * @dev Internal function to add a new collateral token
+     * @param tokenAddress Address of the collateral token
+     * @param collateralRatio Collateral ratio in basis points (10000 = 100%)
+     * @param liquidationThreshold Liquidation threshold in basis points
+     * @param maxAllocation Maximum allocation percentage in basis points
+     */
+    function _addCollateralToken(
+        address tokenAddress,
+        uint256 collateralRatio,
+        uint256 liquidationThreshold,
+        uint256 maxAllocation
+    ) internal {
+        require(tokenAddress != address(0), "Invalid token address");
+        require(collateralRatio <= 10000, "Collateral ratio cannot exceed 100%");
+        require(liquidationThreshold <= collateralRatio, "Liquidation threshold cannot exceed collateral ratio");
+        require(maxAllocation <= 10000, "Max allocation cannot exceed 100%");
+        require(!collateralTokens[tokenAddress].isActive, "Token already added");
+        
+        CollateralToken memory newToken = CollateralToken({
+            tokenAddress: tokenAddress,
+            collateralRatio: collateralRatio,
+            liquidationThreshold: liquidationThreshold,
+            isActive: true,
+            maxAllocation: maxAllocation,
+            totalCollateral: 0
+        });
+        
+        collateralTokens[tokenAddress] = newToken;
+        supportedCollateralTokens.push(tokenAddress);
+        
+        emit CollateralTokenAdded(tokenAddress, collateralRatio, liquidationThreshold, maxAllocation);
+    }
+    
+    /**
+     * @dev Add a new collateral token
+     * @param tokenAddress Address of the collateral token
+     * @param collateralRatio Collateral ratio in basis points (10000 = 100%)
+     * @param liquidationThreshold Liquidation threshold in basis points
+     * @param maxAllocation Maximum allocation percentage in basis points
+     */
+    function addCollateralToken(
+        address tokenAddress,
+        uint256 collateralRatio,
+        uint256 liquidationThreshold,
+        uint256 maxAllocation
+    ) external onlyRole(GOVERNANCE_ROLE) {
+        _addCollateralToken(tokenAddress, collateralRatio, liquidationThreshold, maxAllocation);
+    }
+    
+    /**
+     * @dev Update an existing collateral token configuration
+     * @param tokenAddress Address of the collateral token
+     * @param collateralRatio New collateral ratio in basis points
+     * @param liquidationThreshold New liquidation threshold in basis points
+     * @param isActive New active status
+     * @param maxAllocation New maximum allocation percentage in basis points
+     */
+    function updateCollateralToken(
+        address tokenAddress,
+        uint256 collateralRatio,
+        uint256 liquidationThreshold,
+        bool isActive,
+        uint256 maxAllocation
+    ) external onlyRole(GOVERNANCE_ROLE) {
+        require(collateralTokens[tokenAddress].tokenAddress != address(0), "Token not found");
+        require(collateralRatio <= 10000, "Collateral ratio cannot exceed 100%");
+        require(liquidationThreshold <= collateralRatio, "Liquidation threshold cannot exceed collateral ratio");
+        require(maxAllocation <= 10000, "Max allocation cannot exceed 100%");
+        
+        CollateralToken storage token = collateralTokens[tokenAddress];
+        token.collateralRatio = collateralRatio;
+        token.liquidationThreshold = liquidationThreshold;
+        token.isActive = isActive;
+        token.maxAllocation = maxAllocation;
+        
+        emit CollateralTokenUpdated(tokenAddress, collateralRatio, liquidationThreshold, isActive, maxAllocation);
+    }
+    
+    /**
+     * @dev Remove a collateral token
+     * @param tokenAddress Address of the collateral token to remove
+     */
+    function removeCollateralToken(address tokenAddress) external onlyRole(GOVERNANCE_ROLE) {
+        require(collateralTokens[tokenAddress].tokenAddress != address(0), "Token not found");
+        require(collateralTokens[tokenAddress].totalCollateral == 0, "Cannot remove token with existing collateral");
+        
+        // Find and remove the token from the supportedCollateralTokens array
+        for (uint256 i = 0; i < supportedCollateralTokens.length; i++) {
+            if (supportedCollateralTokens[i] == tokenAddress) {
+                // Replace with the last element and pop
+                supportedCollateralTokens[i] = supportedCollateralTokens[supportedCollateralTokens.length - 1];
+                supportedCollateralTokens.pop();
+                break;
+            }
+        }
+        
+        // Delete the token from the mapping
+        delete collateralTokens[tokenAddress];
+        
+        emit CollateralTokenRemoved(tokenAddress);
+    }
+    
+    /**
+     * @dev Add collateral to the treasury
+     * @param tokenAddress Address of the collateral token
+     * @param amount Amount of collateral to add
+     */
+    function addCollateral(address tokenAddress, uint256 amount) 
+        external 
+        onlyRole(RESERVE_MANAGER_ROLE) 
+        whenNotPaused 
+        nonReentrant
+    {
+        require(collateralTokens[tokenAddress].isActive, "Token not active");
+        require(amount > 0, "Amount must be greater than zero");
+        
+        // Transfer collateral to treasury
+        IERC20(tokenAddress).safeTransferFrom(msg.sender, address(this), amount);
+        
+        // Update collateral tracking
+        collateralTokens[tokenAddress].totalCollateral += amount;
+        
+        // Get the USD value of the added collateral
+        uint256 collateralValue = getCollateralValueInUSD(tokenAddress, amount);
+        
+        // Update total collateral value
+        totalCollateralValue += collateralValue;
+        
+        emit CollateralAdded(tokenAddress, amount, collateralValue);
+    }
+    
+    /**
+     * @dev Remove collateral from the treasury
+     * @param tokenAddress Address of the collateral token
+     * @param amount Amount of collateral to remove
+     * @param recipient Address to send the collateral to
+     */
+    function removeCollateral(
+        address tokenAddress, 
+        uint256 amount, 
+        address recipient
+    ) 
+        external 
+        onlyRole(RESERVE_MANAGER_ROLE) 
+        whenNotPaused 
+        nonReentrant
+    {
+        require(collateralTokens[tokenAddress].isActive, "Token not active");
+        require(amount > 0, "Amount must be greater than zero");
+        require(amount <= collateralTokens[tokenAddress].totalCollateral, "Insufficient collateral");
+        require(recipient != address(0), "Invalid recipient");
+        
+        // Calculate the USD value of the collateral being removed
+        uint256 collateralValue = getCollateralValueInUSD(tokenAddress, amount);
+        
+        // Ensure removing collateral doesn't breach the collateralization ratio
+        uint256 remainingCollateralValue = totalCollateralValue - collateralValue;
+        uint256 requiredCollateralValue = (totalStabulumSupply * getRequiredCollateralRatio()) / 10000;
+        require(remainingCollateralValue >= requiredCollateralValue, "Collateral ratio would be breached");
+        
+        // Update collateral tracking
+        collateralTokens[tokenAddress].totalCollateral -= amount;
+        totalCollateralValue -= collateralValue;
+        
+        // Transfer collateral to recipient
+        IERC20(tokenAddress).safeTransfer(recipient, amount);
+        
+        emit CollateralRemoved(tokenAddress, amount, collateralValue);
+    }
+    
+    /**
+     * @dev Get the collateral value in USD
+     * @param tokenAddress Address of the collateral token
+     * @param amount Amount of collateral
+     * @return The USD value of the collateral
+     */
+    function getCollateralValueInUSD(address tokenAddress, uint256 amount) public view returns (uint256) {
+        // In a real implementation, this would query the oracle for the price
+        // For this example, we'll use a mock implementation
+        return queryOracle(tokenAddress) * amount / 1e18;
+    }
+    
+    /**
+     * @dev Query the oracle for the price of a token
+     * @param tokenAddress Address of the token
+     * @return The price of the token in USD (scaled by 1e18)
+     */
+    function queryOracle(address tokenAddress) public view returns (uint256) {
+        // In a real implementation, this would call the oracle contract
+        // For now, we'll return a mock value of 1 USD for simplicity
+        // This should be replaced with actual oracle implementation
+        return 1e18;
+    }
+    
+    /**
+     * @dev Get the required collateral ratio for the entire system
+     * @return The required collateral ratio in basis points
+     */
+    function getRequiredCollateralRatio() public pure returns (uint256) {
+        // This could be made dynamic based on governance decisions
+        return 10000; // 100% collateralization
+    }
+    
+    /**
+     * @dev Update the Stabulum supply
+     * @param newSupply New total supply of Stabulum
+     */
+    function updateStabulumSupply(uint256 newSupply) external onlyRole(RESERVE_MANAGER_ROLE) {
+        totalStabulumSupply = newSupply;
+    }
+    
+    /**
+     * @dev Update the oracle address
+     * @param newOracleAddress New oracle address
+     */
+    function updateOracle(address newOracleAddress) external onlyRole(GOVERNANCE_ROLE) {
+        require(newOracleAddress != address(0), "Invalid oracle address");
+        
+        address oldOracleAddress = oracleAddress;
+        oracleAddress = newOracleAddress;
+        
+        emit OracleUpdated(oldOracleAddress, newOracleAddress);
+    }
+    
+    /**
+     * @dev Perform a reserve audit
+     * This function recalculates the total collateral value and checks if the stablecoin is fully backed
+     */
+    function performReserveAudit() external onlyRole(RESERVE_MANAGER_ROLE) returns (bool) {
+        uint256 calculatedTotalValue = 0;
+        
+        // Recalculate the total collateral value
+        for (uint256 i = 0; i < supportedCollateralTokens.length; i++) {
+            address tokenAddress = supportedCollateralTokens[i];
+            uint256 tokenAmount = collateralTokens[tokenAddress].totalCollateral;
+            uint256 tokenValue = getCollateralValueInUSD(tokenAddress, tokenAmount);
+            calculatedTotalValue += tokenValue;
+        }
+        
+        // Update the total collateral value
+        totalCollateralValue = calculatedTotalValue;
+        
+        // Update the total Stabulum supply
+        totalStabulumSupply = stabulumToken.totalSupply();
+        
+        // Check if the stablecoin is fully backed
+        uint256 requiredCollateralValue = (totalStabulumSupply * getRequiredCollateralRatio()) / 10000;
+        bool isFullyCollateralized = totalCollateralValue >= requiredCollateralValue;
+        
+        emit ReserveAuditCompleted(block.timestamp, totalCollateralValue, totalStabulumSupply);
+        
+        return isFullyCollateralized;
+    }
+    
+    /**
+     * @dev Get the total number of supported collateral tokens
+     * @return The number of supported collateral tokens
+     */
+    function getSupportedCollateralTokensCount() external view returns (uint256) {
+        return supportedCollateralTokens.length;
+    }
+    
+    /**
+     * @dev Get the collateralization ratio
+     * @return The current collateralization ratio in basis points
+     */
+    function getCollateralizationRatio() external view returns (uint256) {
+        if (totalStabulumSupply == 0) return 0;
+        return (totalCollateralValue * 10000) / totalStabulumSupply;
+    }
+    
+    /**
+     * @dev Pause the contract
+     */
+    function pause() external onlyRole(GOVERNANCE_ROLE) {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpause the contract
+     */
+    function unpause() external onlyRole(GOVERNANCE_ROLE) {
+        _unpause();
+    }
+    
+    /**
+     * @dev Recover tokens accidentally sent to the contract
+     * @param tokenAddress Address of the token to recover
+     * @param amount Amount to recover
+     * @param recipient Address to send the recovered tokens to
+     */
+    function recoverTokens(
+        address tokenAddress, 
+        uint256 amount, 
+        address recipient
+    ) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        // Prevent recovering collateral tokens
+        require(!collateralTokens[tokenAddress].isActive || 
+            amount <= IERC20(tokenAddress).balanceOf(address(this)) - collateralTokens[tokenAddress].totalCollateral,
+            "Cannot recover collateral tokens"
+        );
+        
+        IERC20(tokenAddress).safeTransfer(recipient, amount);
+    }
+}

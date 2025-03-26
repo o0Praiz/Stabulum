@@ -1,0 +1,794 @@
+<!-- Stabulum Documentation Templates -->
+<!-- main-template.hbs (previously created) -->
+
+<!-- contract-template.hbs (continuing) -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{contract.name}} | {{title}} Documentation</title>
+  <!-- Same styles as main template -->
+  <style>
+    /* Contract-specific styles */
+    .contract-header {
+      margin-bottom: 2rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid #ddd;
+    }
+    
+    .metadata {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 1rem;
+      background-color: #f5f5f5;
+      padding: 1rem;
+      border-radius: 5px;
+      margin-bottom: 2rem;
+    }
+    
+    .inheritance {
+      margin-bottom: 2rem;
+    }
+    
+    .inheritance ul {
+      list-style: none;
+      padding: 0;
+      display: flex;
+      flex-wrap: wrap;
+    }
+    
+    .inheritance li {
+      margin-right: 1rem;
+      background-color: var(--secondary-color);
+      color: white;
+      padding: 0.3rem 0.6rem;
+      border-radius: 3px;
+    }
+    
+    .function-item, .event-item, .variable-item {
+      margin-bottom: 1.5rem;
+      padding: 1rem;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+    }
+    
+    .function-signature {
+      background-color: #f5f5f5;
+      padding: 0.5rem;
+      font-family: monospace;
+      overflow-x: auto;
+      margin-bottom: 1rem;
+    }
+    
+    .params-table, .returns-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 1rem;
+    }
+    
+    .params-table th, .params-table td,
+    .returns-table th, .returns-table td {
+      padding: 0.5rem;
+      text-align: left;
+      border: 1px solid #ddd;
+    }
+    
+    .params-table th, .returns-table th {
+      background-color: #f5f5f5;
+    }
+    
+    .tab-container {
+      margin-top: 2rem;
+    }
+    
+    .tabs {
+      display: flex;
+      border-bottom: 1px solid #ddd;
+      margin-bottom: 1rem;
+    }
+    
+    .tab {
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      border: 1px solid transparent;
+    }
+    
+    .tab.active {
+      border: 1px solid #ddd;
+      border-bottom-color: white;
+      border-radius: 5px 5px 0 0;
+      margin-bottom: -1px;
+    }
+    
+    .tab-content {
+      display: none;
+    }
+    
+    .tab-content.active {
+      display: block;
+    }
+    
+    .source-code {
+      background-color: #f5f5f5;
+      padding: 1rem;
+      overflow-x: auto;
+      font-family: monospace;
+      white-space: pre;
+      font-size: 0.9rem;
+      border-radius: 5px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <img src="../assets/{{branding.logo}}" alt="{{title}} Logo" class="logo">
+      <h1>{{title}} Documentation</h1>
+    </div>
+    <div>
+      <span>Version: {{contract.version}}</span>
+    </div>
+  </header>
+  
+  <nav>
+    <ul>
+      <li><a href="../index.html">Home</a></li>
+      <li><a href="../index.html#contracts">Contracts</a></li>
+      <li><a href="../index.html#modules">Modules</a></li>
+      <li><a href="../index.html#guides">Guides</a></li>
+      <li><a href="../api/reference.json">API Reference</a></li>
+      <li><a href="../diagrams/architecture-diagram.svg">Architecture</a></li>
+    </ul>
+  </nav>
+  
+  <div class="container">
+    <div class="contract-header">
+      <h1>{{contract.name}}</h1>
+      <div class="metadata">
+        <p><strong>Author:</strong> {{contract.author}}</p>
+        <p><strong>Version:</strong> {{contract.version}}</p>
+        <p><strong>File:</strong> {{contract.filePath}}</p>
+      </div>
+      
+      <div class="description">
+        {{{markdown contract.description}}}
+      </div>
+      
+      {{#if contract.inheritance.length}}
+      <div class="inheritance">
+        <h2>Inheritance</h2>
+        <ul>
+          {{#each contract.inheritance}}
+          <li>{{this}}</li>
+          {{/each}}
+        </ul>
+      </div>
+      {{/if}}
+    </div>
+    
+    <div class="tab-container">
+      <div class="tabs">
+        <div class="tab active" data-tab="functions">Functions</div>
+        <div class="tab" data-tab="events">Events</div>
+        <div class="tab" data-tab="variables">Variables</div>
+        <div class="tab" data-tab="source">Source Code</div>
+      </div>
+      
+      <div class="tab-content active" id="functions">
+        <h2>Functions</h2>
+        {{#each contract.functions}}
+        <div class="function-item" id="function-{{anchorLink name}}">
+          <h3>{{name}}</h3>
+          <div class="function-signature">
+            function {{name}}{{parameterList params}} {{visibility}} {{stateMutability}} 
+            {{#if returns.length}}
+            returns ({{#each returns}}{{type}}{{#unless @last}}, {{/unless}}{{/each}})
+            {{/if}}
+          </div>
+          
+          <div class="function-description">
+            {{{markdown description}}}
+          </div>
+          
+          {{#if modifiers.length}}
+          <div class="modifiers">
+            <h4>Modifiers</h4>
+            <ul>
+              {{#each modifiers}}
+              <li>{{this}}</li>
+              {{/each}}
+            </ul>
+          </div>
+          {{/if}}
+          
+          {{#if params.length}}
+          <div class="params">
+            <h4>Parameters</h4>
+            <table class="params-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {{#each params}}
+                <tr>
+                  <td>{{name}}</td>
+                  <td><code>{{type}}</code></td>
+                  <td>{{{markdown description}}}</td>
+                </tr>
+                {{/each}}
+              </tbody>
+            </table>
+          </div>
+          {{/if}}
+          
+          {{#if returns.length}}
+          <div class="returns">
+            <h4>Returns</h4>
+            <table class="returns-table">
+              <thead>
+                <tr>
+                  <th>Type</th>
+                  <th>Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {{#each returns}}
+                <tr>
+                  <td><code>{{type}}</code></td>
+                  <td>{{{markdown description}}}</td>
+                </tr>
+                {{/each}}
+              </tbody>
+            </table>
+          </div>
+          {{/if}}
+          
+          <div class="source">
+            <h4>Source</h4>
+            <pre class="source-code">{{source}}</pre>
+          </div>
+        </div>
+        {{/each}}
+      </div>
+      
+      <div class="tab-content" id="events">
+        <h2>Events</h2>
+        {{#each contract.events}}
+        <div class="event-item" id="event-{{anchorLink name}}">
+          <h3>{{name}}</h3>
+          <div class="event-signature">
+            event {{name}}({{#each params}}{{type}} {{name}}{{#unless @last}}, {{/unless}}{{/each}})
+          </div>
+          
+          <div class="event-description">
+            {{{markdown description}}}
+          </div>
+          
+          {{#if params.length}}
+          <div class="params">
+            <h4>Parameters</h4>
+            <table class="params-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {{#each params}}
+                <tr>
+                  <td>{{name}}</td>
+                  <td><code>{{type}}</code></td>
+                  <td>{{{markdown description}}}</td>
+                </tr>
+                {{/each}}
+              </tbody>
+            </table>
+          </div>
+          {{/if}}
+          
+          <div class="source">
+            <h4>Source</h4>
+            <pre class="source-code">{{source}}</pre>
+          </div>
+        </div>
+        {{/each}}
+      </div>
+      
+      <div class="tab-content" id="variables">
+        <h2>State Variables</h2>
+        {{#each contract.variables}}
+        <div class="variable-item" id="variable-{{anchorLink name}}">
+          <h3>{{name}}</h3>
+          <div class="variable-signature">
+            {{type}} {{visibility}} {{#if constant}}constant {{/if}}{{name}}
+          </div>
+          
+          <div class="variable-description">
+            {{{markdown description}}}
+          </div>
+          
+          <div class="source">
+            <h4>Source</h4>
+            <pre class="source-code">{{source}}</pre>
+          </div>
+        </div>
+        {{/each}}
+      </div>
+      
+      <div class="tab-content" id="source">
+        <h2>Source Code</h2>
+        <pre class="source-code">{{contract.sourceCode}}</pre>
+      </div>
+    </div>
+  </div>
+  
+  <footer>
+    <p>© 2025 Stabulum Stablecoin. All rights reserved.</p>
+  </footer>
+  
+  <script>
+    // Tab functionality
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        // Remove active class from all tabs and content
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        
+        // Add active class to clicked tab
+        tab.classList.add('active');
+        
+        // Show corresponding content
+        const tabId = tab.getAttribute('data-tab');
+        document.getElementById(tabId).classList.add('active');
+      });
+    });
+  </script>
+</body>
+</html>
+
+<!-- function-template.hbs -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{function.name}} | {{contract.name}} | Documentation</title>
+  <!-- Same styles as main template -->
+</head>
+<body>
+  <header>
+    <div>
+      <img src="../../../assets/{{branding.logo}}" alt="Logo" class="logo">
+      <h1>Function Documentation</h1>
+    </div>
+  </header>
+  
+  <nav>
+    <ul>
+      <li><a href="../../../index.html">Home</a></li>
+      <li><a href="../../../index.html#contracts">Contracts</a></li>
+      <li><a href="../../{{contract.name}}.html">{{contract.name}}</a></li>
+    </ul>
+  </nav>
+  
+  <div class="container">
+    <div class="function-header">
+      <h1>{{function.name}}</h1>
+      <div class="contract-link">
+        <p>Contract: <a href="../../{{contract.name}}.html">{{contract.name}}</a></p>
+      </div>
+      
+      <div class="function-signature">
+        function {{function.name}}{{parameterList function.params}} {{function.visibility}} {{function.stateMutability}} 
+        {{#if function.returns.length}}
+        returns ({{#each function.returns}}{{type}}{{#unless @last}}, {{/unless}}{{/each}})
+        {{/if}}
+      </div>
+      
+      <div class="function-description">
+        {{{markdown function.description}}}
+      </div>
+    </div>
+    
+    {{#if function.modifiers.length}}
+    <div class="modifiers">
+      <h2>Modifiers</h2>
+      <ul>
+        {{#each function.modifiers}}
+        <li>{{this}}</li>
+        {{/each}}
+      </ul>
+    </div>
+    {{/if}}
+    
+    {{#if function.params.length}}
+    <div class="params">
+      <h2>Parameters</h2>
+      <table class="params-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{#each function.params}}
+          <tr>
+            <td>{{name}}</td>
+            <td><code>{{type}}</code></td>
+            <td>{{{markdown description}}}</td>
+          </tr>
+          {{/each}}
+        </tbody>
+      </table>
+    </div>
+    {{/if}}
+    
+    {{#if function.returns.length}}
+    <div class="returns">
+      <h2>Returns</h2>
+      <table class="returns-table">
+        <thead>
+          <tr>
+            <th>Type</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{#each function.returns}}
+          <tr>
+            <td><code>{{type}}</code></td>
+            <td>{{{markdown description}}}</td>
+          </tr>
+          {{/each}}
+        </tbody>
+      </table>
+    </div>
+    {{/if}}
+    
+    <div class="source">
+      <h2>Source</h2>
+      <pre class="source-code">{{function.source}}</pre>
+    </div>
+  </div>
+  
+  <footer>
+    <p>© 2025 Stabulum Stablecoin. All rights reserved.</p>
+  </footer>
+</body>
+</html>
+
+<!-- module-template.hbs -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{module.name}} | Documentation</title>
+  <!-- Same styles as main template -->
+</head>
+<body>
+  <header>
+    <div>
+      <img src="../assets/{{branding.logo}}" alt="Logo" class="logo">
+      <h1>Module Documentation</h1>
+    </div>
+  </header>
+  
+  <nav>
+    <ul>
+      <li><a href="../index.html">Home</a></li>
+      <li><a href="../index.html#modules">Modules</a></li>
+    </ul>
+  </nav>
+  
+  <div class="container">
+    <div class="module-header">
+      <h1>{{module.name}}</h1>
+      <div class="file-path">
+        <p>File: {{module.filePath}}</p>
+      </div>
+      
+      <div class="module-description">
+        {{{markdown module.description}}}
+      </div>
+    </div>
+    
+    <div class="tab-container">
+      <div class="tabs">
+        <div class="tab active" data-tab="functions">Functions</div>
+        <div class="tab" data-tab="classes">Classes</div>
+        <div class="tab" data-tab="interfaces">Interfaces</div>
+        <div class="tab" data-tab="source">Source Code</div>
+      </div>
+      
+      <div class="tab-content active" id="functions">
+        <h2>Functions</h2>
+        {{#each module.functions}}
+        <div class="function-item">
+          <h3>{{name}}</h3>
+          <div class="function-description">
+            {{{markdown description}}}
+          </div>
+          
+          {{#if params.length}}
+          <div class="params">
+            <h4>Parameters</h4>
+            <table class="params-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {{#each params}}
+                <tr>
+                  <td>{{name}}</td>
+                  <td><code>{{type}}</code></td>
+                  <td>{{{markdown description}}}</td>
+                </tr>
+                {{/each}}
+              </tbody>
+            </table>
+          </div>
+          {{/if}}
+          
+          {{#if returns.length}}
+          <div class="returns">
+            <h4>Returns</h4>
+            <table class="returns-table">
+              <thead>
+                <tr>
+                  <th>Type</th>
+                  <th>Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {{#each returns}}
+                <tr>
+                  <td><code>{{type}}</code></td>
+                  <td>{{{markdown description}}}</td>
+                </tr>
+                {{/each}}
+              </tbody>
+            </table>
+          </div>
+          {{/if}}
+        </div>
+        {{/each}}
+      </div>
+      
+      <div class="tab-content" id="classes">
+        <h2>Classes</h2>
+        {{#each module.classes}}
+        <div class="class-item">
+          <h3>{{name}}</h3>
+          <div class="class-description">
+            {{{markdown description}}}
+          </div>
+          
+          {{#if properties.length}}
+          <div class="properties">
+            <h4>Properties</h4>
+            <table class="properties-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Visibility</th>
+                  <th>Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {{#each properties}}
+                <tr>
+                  <td>{{name}}</td>
+                  <td><code>{{type}}</code></td>
+                  <td>{{visibility}}</td>
+                  <td>{{{markdown description}}}</td>
+                </tr>
+                {{/each}}
+              </tbody>
+            </table>
+          </div>
+          {{/if}}
+          
+          {{#if methods.length}}
+          <div class="methods">
+            <h4>Methods</h4>
+            {{#each methods}}
+            <div class="method-item">
+              <h5>{{name}}</h5>
+              <div class="method-description">
+                {{{markdown description}}}
+              </div>
+              
+              {{#if params.length}}
+              <div class="params">
+                <h6>Parameters</h6>
+                <table class="params-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Type</th>
+                      <th>Description</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {{#each params}}
+                    <tr>
+                      <td>{{name}}</td>
+                      <td><code>{{type}}</code></td>
+                      <td>{{{markdown description}}}</td>
+                    </tr>
+                    {{/each}}
+                  </tbody>
+                </table>
+              </div>
+              {{/if}}
+              
+              {{#if returns.length}}
+              <div class="returns">
+                <h6>Returns</h6>
+                <table class="returns-table">
+                  <thead>
+                    <tr>
+                      <th>Type</th>
+                      <th>Description</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {{#each returns}}
+                    <tr>
+                      <td><code>{{type}}</code></td>
+                      <td>{{{markdown description}}}</td>
+                    </tr>
+                    {{/each}}
+                  </tbody>
+                </table>
+              </div>
+              {{/if}}
+            </div>
+            {{/each}}
+          </div>
+          {{/if}}
+        </div>
+        {{/each}}
+      </div>
+      
+      <div class="tab-content" id="interfaces">
+        <h2>Interfaces</h2>
+        {{#each module.interfaces}}
+        <div class="interface-item">
+          <h3>{{name}}</h3>
+          <div class="interface-description">
+            {{{markdown description}}}
+          </div>
+          
+          {{#if properties.length}}
+          <div class="properties">
+            <h4>Properties</h4>
+            <table class="properties-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {{#each properties}}
+                <tr>
+                  <td>{{name}}</td>
+                  <td><code>{{type}}</code></td>
+                  <td>{{{markdown description}}}</td>
+                </tr>
+                {{/each}}
+              </tbody>
+            </table>
+          </div>
+          {{/if}}
+          
+          {{#if methods.length}}
+          <div class="methods">
+            <h4>Methods</h4>
+            {{#each methods}}
+            <div class="method-item">
+              <h5>{{name}}</h5>
+              <div class="method-description">
+                {{{markdown description}}}
+              </div>
+              
+              {{#if params.length}}
+              <div class="params">
+                <h6>Parameters</h6>
+                <table class="params-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Type</th>
+                      <th>Description</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {{#each params}}
+                    <tr>
+                      <td>{{name}}</td>
+                      <td><code>{{type}}</code></td>
+                      <td>{{{markdown description}}}</td>
+                    </tr>
+                    {{/each}}
+                  </tbody>
+                </table>
+              </div>
+              {{/if}}
+              
+              {{#if returns.length}}
+              <div class="returns">
+                <h6>Returns</h6>
+                <table class="returns-table">
+                  <thead>
+                    <tr>
+                      <th>Type</th>
+                      <th>Description</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {{#each returns}}
+                    <tr>
+                      <td><code>{{type}}</code></td>
+                      <td>{{{markdown description}}}</td>
+                    </tr>
+                    {{/each}}
+                  </tbody>
+                </table>
+              </div>
+              {{/if}}
+            </div>
+            {{/each}}
+          </div>
+          {{/if}}
+        </div>
+        {{/each}}
+      </div>
+      
+      <div class="tab-content" id="source">
+        <h2>Source Code</h2>
+        <pre class="source-code">{{module.sourceCode}}</pre>
+      </div>
+    </div>
+  </div>
+  
+  <footer>
+    <p>© 2025 Stabulum Stablecoin. All rights reserved.</p>
+  </footer>
+  
+  <script>
+    // Tab functionality
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        // Remove active class from all tabs and content
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        
+        // Add active class to clicked tab
+        tab.classList.add('active');
+        
+        // Show corresponding content
+        const tabId = tab.getAttribute('data-tab');
+        document.getElementById(tabId).classList.add('active');
+      });
+    });
+  </script>
+</body>
+</html>

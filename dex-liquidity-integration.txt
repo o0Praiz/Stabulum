@@ -1,0 +1,375 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @title StabulumLiquidityManager
+ * @dev Manages liquidity provision and integrations with major DEXs for Stabulum
+ */
+contract StabulumLiquidityManager is AccessControl, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // Roles
+    bytes32 public constant LIQUIDITY_MANAGER_ROLE = keccak256("LIQUIDITY_MANAGER_ROLE");
+    
+    // Tokens
+    IERC20 public stabulumToken;
+    
+    // Supported DEXs and liquidity pools
+    struct LiquidityPool {
+        address poolAddress;
+        address routerAddress;
+        string dexName;
+        bool isActive;
+    }
+    
+    mapping(uint256 => LiquidityPool) public liquidityPools;
+    uint256 public poolCount;
+    
+    // Events
+    event LiquidityPoolAdded(uint256 poolId, address poolAddress, address routerAddress, string dexName);
+    event LiquidityPoolUpdated(uint256 poolId, address poolAddress, address routerAddress, bool isActive);
+    event LiquidityAdded(uint256 poolId, uint256 stabulumAmount, uint256 pairTokenAmount);
+    event LiquidityRemoved(uint256 poolId, uint256 stabulumAmount, uint256 pairTokenAmount);
+    event RewardsHarvested(uint256 poolId, address rewardToken, uint256 amount);
+    
+    /**
+     * @dev Initialize the liquidity manager
+     * @param _stabulumToken Address of the Stabulum token
+     */
+    constructor(address _stabulumToken) {
+        require(_stabulumToken != address(0), "Invalid Stabulum token address");
+        
+        stabulumToken = IERC20(_stabulumToken);
+        
+        // Set up roles
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(LIQUIDITY_MANAGER_ROLE, msg.sender);
+    }
+    
+    /**
+     * @dev Add a new liquidity pool
+     * @param _poolAddress Address of the liquidity pool
+     * @param _routerAddress Address of the DEX router
+     * @param _dexName Name of the DEX
+     */
+    function addLiquidityPool(
+        address _poolAddress,
+        address _routerAddress,
+        string memory _dexName
+    ) 
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        require(_poolAddress != address(0), "Invalid pool address");
+        require(_routerAddress != address(0), "Invalid router address");
+        require(bytes(_dexName).length > 0, "Invalid DEX name");
+        
+        uint256 newPoolId = poolCount;
+        liquidityPools[newPoolId] = LiquidityPool({
+            poolAddress: _poolAddress,
+            routerAddress: _routerAddress,
+            dexName: _dexName,
+            isActive: true
+        });
+        
+        poolCount++;
+        
+        emit LiquidityPoolAdded(newPoolId, _poolAddress, _routerAddress, _dexName);
+    }
+    
+    /**
+     * @dev Update an existing liquidity pool
+     * @param _poolId ID of the pool to update
+     * @param _poolAddress New pool address
+     * @param _routerAddress New router address
+     * @param _isActive Whether the pool is active
+     */
+    function updateLiquidityPool(
+        uint256 _poolId,
+        address _poolAddress,
+        address _routerAddress,
+        bool _isActive
+    ) 
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        require(_poolId < poolCount, "Invalid pool ID");
+        require(_poolAddress != address(0), "Invalid pool address");
+        require(_routerAddress != address(0), "Invalid router address");
+        
+        liquidityPools[_poolId].poolAddress = _poolAddress;
+        liquidityPools[_poolId].routerAddress = _routerAddress;
+        liquidityPools[_poolId].isActive = _isActive;
+        
+        emit LiquidityPoolUpdated(_poolId, _poolAddress, _routerAddress, _isActive);
+    }
+    
+    /**
+     * @dev Add liquidity to a pool via the respective DEX router
+     * @param _poolId ID of the pool
+     * @param _pairToken Address of the paired token
+     * @param _stabulumAmount Amount of Stabulum tokens to add
+     * @param _pairTokenAmount Amount of paired tokens to add
+     * @param _slippageTolerance Maximum slippage tolerance in basis points (e.g., 100 = 1%)
+     */
+    function addLiquidity(
+        uint256 _poolId,
+        address _pairToken,
+        uint256 _stabulumAmount,
+        uint256 _pairTokenAmount,
+        uint256 _slippageTolerance
+    ) 
+        external
+        onlyRole(LIQUIDITY_MANAGER_ROLE) 
+        nonReentrant 
+    {
+        require(_poolId < poolCount, "Invalid pool ID");
+        require(liquidityPools[_poolId].isActive, "Pool is not active");
+        require(_pairToken != address(0), "Invalid pair token address");
+        require(_stabulumAmount > 0, "Invalid Stabulum amount");
+        require(_pairTokenAmount > 0, "Invalid pair token amount");
+        
+        LiquidityPool memory pool = liquidityPools[_poolId];
+        
+        // Transfer tokens to this contract
+        stabulumToken.safeTransferFrom(msg.sender, address(this), _stabulumAmount);
+        IERC20(_pairToken).safeTransferFrom(msg.sender, address(this), _pairTokenAmount);
+        
+        // Approve router to spend tokens
+        stabulumToken.safeApprove(pool.routerAddress, _stabulumAmount);
+        IERC20(_pairToken).safeApprove(pool.routerAddress, _pairTokenAmount);
+        
+        // Add liquidity based on DEX type (simplified for example)
+        if (compareStrings(pool.dexName, "Uniswap")) {
+            addLiquidityUniswap(pool.routerAddress, address(stabulumToken), _pairToken, _stabulumAmount, _pairTokenAmount, _slippageTolerance);
+        } else if (compareStrings(pool.dexName, "SushiSwap")) {
+            addLiquiditySushiSwap(pool.routerAddress, address(stabulumToken), _pairToken, _stabulumAmount, _pairTokenAmount, _slippageTolerance);
+        } else if (compareStrings(pool.dexName, "PancakeSwap")) {
+            addLiquidityPancakeSwap(pool.routerAddress, address(stabulumToken), _pairToken, _stabulumAmount, _pairTokenAmount, _slippageTolerance);
+        } else {
+            revert("Unsupported DEX");
+        }
+        
+        emit LiquidityAdded(_poolId, _stabulumAmount, _pairTokenAmount);
+    }
+    
+    /**
+     * @dev Remove liquidity from a pool
+     * @param _poolId ID of the pool
+     * @param _pairToken Address of the paired token
+     * @param _lpTokenAmount Amount of LP tokens to remove
+     * @param _minStabulumAmount Minimum amount of Stabulum tokens to receive
+     * @param _minPairTokenAmount Minimum amount of paired tokens to receive
+     */
+    function removeLiquidity(
+        uint256 _poolId,
+        address _pairToken,
+        uint256 _lpTokenAmount,
+        uint256 _minStabulumAmount,
+        uint256 _minPairTokenAmount
+    ) 
+        external
+        onlyRole(LIQUIDITY_MANAGER_ROLE) 
+        nonReentrant 
+    {
+        require(_poolId < poolCount, "Invalid pool ID");
+        require(_pairToken != address(0), "Invalid pair token address");
+        require(_lpTokenAmount > 0, "Invalid LP token amount");
+        
+        LiquidityPool memory pool = liquidityPools[_poolId];
+        
+        // Transfer LP tokens to this contract
+        IERC20(pool.poolAddress).safeTransferFrom(msg.sender, address(this), _lpTokenAmount);
+        
+        // Approve router to spend LP tokens
+        IERC20(pool.poolAddress).safeApprove(pool.routerAddress, _lpTokenAmount);
+        
+        // Remove liquidity based on DEX type (simplified for example)
+        uint256 stabulumReceived;
+        uint256 pairTokenReceived;
+        
+        if (compareStrings(pool.dexName, "Uniswap")) {
+            (stabulumReceived, pairTokenReceived) = removeLiquidityUniswap(
+                pool.routerAddress, 
+                address(stabulumToken), 
+                _pairToken, 
+                _lpTokenAmount, 
+                _minStabulumAmount, 
+                _minPairTokenAmount
+            );
+        } else if (compareStrings(pool.dexName, "SushiSwap")) {
+            (stabulumReceived, pairTokenReceived) = removeLiquiditySushiSwap(
+                pool.routerAddress, 
+                address(stabulumToken), 
+                _pairToken, 
+                _lpTokenAmount, 
+                _minStabulumAmount, 
+                _minPairTokenAmount
+            );
+        } else if (compareStrings(pool.dexName, "PancakeSwap")) {
+            (stabulumReceived, pairTokenReceived) = removeLiquidityPancakeSwap(
+                pool.routerAddress, 
+                address(stabulumToken), 
+                _pairToken, 
+                _lpTokenAmount, 
+                _minStabulumAmount, 
+                _minPairTokenAmount
+            );
+        } else {
+            revert("Unsupported DEX");
+        }
+        
+        // Transfer tokens back to sender
+        stabulumToken.safeTransfer(msg.sender, stabulumReceived);
+        IERC20(_pairToken).safeTransfer(msg.sender, pairTokenReceived);
+        
+        emit LiquidityRemoved(_poolId, stabulumReceived, pairTokenReceived);
+    }
+    
+    /**
+     * @dev Harvest rewards from liquidity pools (e.g., trading fees, liquidity mining rewards)
+     * @param _poolId ID of the pool
+     */
+    function harvestRewards(uint256 _poolId) 
+        external
+        onlyRole(LIQUIDITY_MANAGER_ROLE) 
+        nonReentrant 
+    {
+        require(_poolId < poolCount, "Invalid pool ID");
+        LiquidityPool memory pool = liquidityPools[_poolId];
+        
+        // This is a simplified example - actual implementation would depend on the specific DEX
+        // and their reward mechanism
+        
+        // For demonstration purposes, we'll just emit an event
+        emit RewardsHarvested(_poolId, address(0), 0);
+    }
+    
+    /**
+     * @dev Internal function to add liquidity to Uniswap-like DEXs
+     */
+    function addLiquidityUniswap(
+        address _router,
+        address _tokenA,
+        address _tokenB,
+        uint256 _amountA,
+        uint256 _amountB,
+        uint256 _slippageTolerance
+    ) internal {
+        // This would contain the actual implementation using the Uniswap V2/V3 router interface
+        // For example:
+        // IUniswapV2Router02(_router).addLiquidity(
+        //     _tokenA,
+        //     _tokenB,
+        //     _amountA,
+        //     _amountB,
+        //     _amountA * (10000 - _slippageTolerance) / 10000,
+        //     _amountB * (10000 - _slippageTolerance) / 10000,
+        //     address(this),
+        //     block.timestamp + 600
+        // );
+    }
+    
+    /**
+     * @dev Internal function to add liquidity to SushiSwap
+     */
+    function addLiquiditySushiSwap(
+        address _router,
+        address _tokenA,
+        address _tokenB,
+        uint256 _amountA,
+        uint256 _amountB,
+        uint256 _slippageTolerance
+    ) internal {
+        // Similar to Uniswap implementation as SushiSwap uses the same interface
+    }
+    
+    /**
+     * @dev Internal function to add liquidity to PancakeSwap
+     */
+    function addLiquidityPancakeSwap(
+        address _router,
+        address _tokenA,
+        address _tokenB,
+        uint256 _amountA,
+        uint256 _amountB,
+        uint256 _slippageTolerance
+    ) internal {
+        // Similar to Uniswap implementation as PancakeSwap uses a compatible interface
+    }
+    
+    /**
+     * @dev Internal function to remove liquidity from Uniswap-like DEXs
+     */
+    function removeLiquidityUniswap(
+        address _router,
+        address _tokenA,
+        address _tokenB,
+        uint256 _liquidity,
+        uint256 _minA,
+        uint256 _minB
+    ) internal returns (uint256 amountA, uint256 amountB) {
+        // This would contain the actual implementation using the Uniswap V2/V3 router interface
+        // For example:
+        // (amountA, amountB) = IUniswapV2Router02(_router).removeLiquidity(
+        //     _tokenA,
+        //     _tokenB,
+        //     _liquidity,
+        //     _minA,
+        //     _minB,
+        //     address(this),
+        //     block.timestamp + 600
+        // );
+        
+        return (0, 0); // Placeholder return
+    }
+    
+    /**
+     * @dev Internal function to remove liquidity from SushiSwap
+     */
+    function removeLiquiditySushiSwap(
+        address _router,
+        address _tokenA,
+        address _tokenB,
+        uint256 _liquidity,
+        uint256 _minA,
+        uint256 _minB
+    ) internal returns (uint256 amountA, uint256 amountB) {
+        // Similar to Uniswap implementation
+        return (0, 0); // Placeholder return
+    }
+    
+    /**
+     * @dev Internal function to remove liquidity from PancakeSwap
+     */
+    function removeLiquidityPancakeSwap(
+        address _router,
+        address _tokenA,
+        address _tokenB,
+        uint256 _liquidity,
+        uint256 _minA,
+        uint256 _minB
+    ) internal returns (uint256 amountA, uint256 amountB) {
+        // Similar to Uniswap implementation
+        return (0, 0); // Placeholder return
+    }
+    
+    /**
+     * @dev Helper function to compare strings
+     */
+    function compareStrings(string memory a, string memory b) internal pure returns (bool) {
+        return (keccak256(abi.encodePacked(a)) == keccak256(abi.encodePacked(b)));
+    }
+    
+    /**
+     * @dev Emergency function to recover ERC20 tokens
+     */
+    function recoverERC20(address _token, uint256 _amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        IERC20(_token).safeTransfer(msg.sender, _amount);
+    }
+}

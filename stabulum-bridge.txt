@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+
+interface IStabulum {
+    function mint(address to, uint256 amount) external;
+    function burn(address from, uint256 amount) external;
+    function balanceOf(address account) external view returns (uint256);
+}
+
+/**
+ * @title StabulumBridge
+ * @dev Cross-chain bridge for Stabulum stablecoin
+ * Features:
+ * - Lock and release mechanism for cross-chain transfers
+ * - Multi-signature validation for transfer requests
+ * - Security features to prevent double-spending
+ */
+contract StabulumBridge is 
+    Initializable, 
+    AccessControlUpgradeable, 
+    PausableUpgradeable, 
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable 
+{
+    // Role definitions
+    bytes32 public constant BRIDGE_OPERATOR_ROLE = keccak256("BRIDGE_OPERATOR_ROLE");
+    bytes32 public constant VALIDATOR_ROLE = keccak256("VALIDATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    
+    // Address of the Stabulum token contract
+    address public stabulumToken;
+    
+    // Cross-chain transaction status
+    enum TransactionStatus { PENDING, COMPLETED, REJECTED }
+    
+    // Cross-chain transaction details
+    struct BridgeTransaction {
+        uint256 transactionId;
+        address sender;
+        address recipient;
+        uint256 amount;
+        uint256 sourceChainId;
+        uint256 destinationChainId;
+        uint256 timestamp;
+        TransactionStatus status;
+        uint256 validations;
+        string transactionHash;
+    }
+    
+    // Mapping from transaction ID to bridge transaction
+    mapping(uint256 => BridgeTransaction) public transactions;
+    
+    // Mapping from transaction hash to transaction ID to prevent double processing
+    mapping(string => uint256) public processedTransactions;
+    
+    // Counter for transaction IDs
+    uint256 public nextTransactionId;
+    
+    // Minimum validations required to complete a transaction
+    uint256 public requiredValidations;
+    
+    // Validator tracking for each transaction
+    mapping(uint256 => mapping(address => bool)) public hasValidated;
+    
+    // Events
+    event TransactionInitiated(
+        uint256 indexed transactionId,
+        address indexed sender,
+        address indexed recipient,
+        uint256 amount,
+        uint256 sourceChainId,
+        uint256 destinationChainId
+    );
+    event TransactionValidated(
+        uint256 indexed transactionId,
+        address indexed validator,
+        uint256 validations
+    );
+    event TransactionCompleted(
+        uint256 indexed transactionId,
+        address indexed recipient,
+        uint256 amount,
+        uint256 destinationChainId
+    );
+    event TransactionRejected(
+        uint256 indexed transactionId,
+        string reason
+    );
+    
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+    
+    /**
+     * @dev Initializes the contract
+     * @param admin The initial admin address
+     * @param _stabulumToken The address of the Stabulum token contract
+     * @param _requiredValidations The minimum validations required
+     */
+    function initialize(
+        address admin, 
+        address _stabulumToken, 
+        uint256 _requiredValidations
+    ) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+        
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(BRIDGE_OPERATOR_ROLE, admin);
+        _grantRole(VALIDATOR_ROLE, admin);
+        _grantRole(UPGRADER_ROLE, admin);
+        _grantRole(PAUSER_ROLE, admin);
+        
+        stabulumToken = _stabulumToken;
+        requiredValidations = _requiredValidations;
+        nextTransactionId = 1;
+    }
+    
+    /**
+     * @dev Updates the required number of validations
+     * @param _requiredValidations The new number of required validations
+     */
+    function setRequiredValidations(uint256 _requiredValidations) 
+        public 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        require(_requiredValidations > 0, "Must require at least one validation");
+        requiredValidations = _requiredValidations;
+    }
+    
+    /**
+     * @dev Initiates a transaction to transfer tokens to another chain
+     * @param recipient The recipient address on the destination chain
+     * @param amount The amount to transfer
+     * @param destinationChainId The ID of the destination chain
+     */
+    function initiateTransfer(
+        address recipient,
+        uint256 amount,
+        uint256 destinationChainId
+    ) 
+        public 
+        whenNotPaused 
+        nonReentrant 
+    {
+        require(destinationChainId != block.chainid, "Cannot transfer to same chain");
+        require(amount > 0, "Amount must be greater than zero");
+        require(IStabulum(stabulumToken).balanceOf(msg.sender) >= amount, "Insufficient balance");
+        
+        // Lock tokens by burning them
+        IStabulum(stabulumToken).burn(msg.sender, amount);
+        
+        // Create transaction record
+        uint256 transactionId = nextTransactionId++;
+        transactions[transactionId] = BridgeTransaction({
+            transactionId: transactionId,
+            sender: msg.sender,
+            recipient: recipient,
+            amount: amount,
+            sourceChainId: block.chainid,
+            destinationChainId: destinationChainId,
+            timestamp: block.timestamp,
+            status: TransactionStatus.PENDING,
+            validations: 0,
+            transactionHash: ""
+        });
+        
+        emit TransactionInitiated(
+            transactionId,
+            msg.sender,
+            recipient,
+            amount,
+            block.chainid,
+            destinationChainId
+        );
+    }
+    
+    /**
+     * @dev Records an incoming transfer from another chain
+     * @param sender The sender address on the source chain
+     * @param recipient The recipient address on this chain
+     * @param amount The amount to transfer
+     * @param sourceChainId The ID of the source chain
+     * @param transactionHash The hash of the transaction on the source chain
+     */
+    function recordIncomingTransfer(
+        address sender,
+        address recipient,
+        uint256 amount,
+        uint256 sourceChainId,
+        string memory transactionHash
+    ) 
+        public 
+        onlyRole(BRIDGE_OPERATOR_ROLE)
+        whenNotPaused 
+        nonReentrant 
+    {
+        require(sourceChainId != block.chainid, "Cannot transfer from same chain");
+        require(amount > 0, "Amount must be greater than zero");
+        require(bytes(transactionHash).length > 0, "Transaction hash cannot be empty");
+        require(processedTransactions[transactionHash] == 0, "Transaction already processed");
+        
+        // Create transaction record
+        uint256 transactionId = nextTransactionId++;
+        transactions[transactionId] = BridgeTransaction({
+            transactionId: transactionId,
+            sender: sender,
+            recipient: recipient,
+            amount: amount,
+            sourceChainId: sourceChainId,
+            destinationChainId: block.chainid,
+            timestamp: block.timestamp,
+            status: TransactionStatus.PENDING,
+            validations: 0,
+            transactionHash: transactionHash
+        });
+        
+        // Mark transaction hash as processed
+        processedTransactions[transactionHash] = transactionId;
+        
+        emit TransactionInitiated(
+            transactionId,
+            sender,
+            recipient,
+            amount,
+            sourceChainId,
+            block.chainid
+        );
+    }
+    
+    /**
+     * @dev Validates a pending transaction
+     * @param transactionId The ID of the transaction to validate
+     */
+    function validateTransaction(uint256 transactionId) 
+        public 
+        onlyRole(VALIDATOR_ROLE)
+        whenNotPaused 
+    {
+        BridgeTransaction storage transaction = transactions[transactionId];
+        require(transaction.transactionId == transactionId, "Transaction does not exist");
+        require(transaction.status == TransactionStatus.PENDING, "Transaction is not pending");
+        require(!hasValidated[transactionId][msg.sender], "Validator has already validated");
+        
+        // Record validation
+        hasValidated[transactionId][msg.sender] = true;
+        transaction.validations++;
+        
+        emit TransactionValidated(
+            transactionId,
+            msg.sender,
+            transaction.validations
+        );
+        
+        // Check if enough validations
+        if (transaction.validations >= requiredValidations) {
+            if (transaction.destinationChainId == block.chainid) {
+                // This is the destination chain, mint tokens
+                IStabulum(stabulumToken).mint(transaction.recipient, transaction.amount);
+                
+                transaction.status = TransactionStatus.COMPLETED;
+                
+                emit TransactionCompleted(
+                    transactionId,
+                    transaction.recipient,
+                    transaction.amount,
+                    block.chainid
+                );
+            } 
+            // If this is the source chain, the transaction remains in PENDING
+            // until it's confirmed on the destination chain
+        }
+    }
+    
+    /**
+     * @dev Completes a transaction on the source chain after confirmation on destination chain
+     * @param transactionId The ID of the transaction to complete
+     * @param confirmationHash The hash of the confirmation on the destination chain
+     */
+    function completeSourceTransaction(
+        uint256 transactionId, 
+        string memory confirmationHash
+    ) 
+        public 
+        onlyRole(BRIDGE_OPERATOR_ROLE)
+        whenNotPaused 
+    {
+        BridgeTransaction storage transaction = transactions[transactionId];
+        require(transaction.transactionId == transactionId, "Transaction does not exist");
+        require(transaction.status == TransactionStatus.PENDING, "Transaction is not pending");
+        require(transaction.sourceChainId == block.chainid, "Not a source chain transaction");
+        require(bytes(confirmationHash).length > 0, "Confirmation hash cannot be empty");
+        
+        transaction.status = TransactionStatus.COMPLETED;
+        transaction.transactionHash = confirmationHash;
+        
+        emit TransactionCompleted(
+            transactionId,
+            transaction.recipient,
+            transaction.amount,
+            transaction.destinationChainId
+        );
+    }
+    
+    /**
+     * @dev Rejects a transaction
+     * @param transactionId The ID of the transaction to reject
+     * @param reason The reason for rejection
+     */
+    function rejectTransaction(uint256 transactionId, string memory reason) 
+        public 
+        onlyRole(BRIDGE_OPERATOR_ROLE) 
+    {
+        BridgeTransaction storage transaction = transactions[transactionId];
+        require(transaction.transactionId == transactionId, "Transaction does not exist");
+        require(transaction.status == TransactionStatus.PENDING, "Transaction is not pending");
+        
+        transaction.status = TransactionStatus.REJECTED;
+        
+        // If this is the source chain, refund tokens
+        if (transaction.sourceChainId == block.chainid) {
+            IStabulum(stabulumToken).mint(transaction.sender, transaction.amount);
+        }
+        
+        emit TransactionRejected(transactionId, reason);
+    }
+    
+    /**
+     * @dev Gets a transaction by ID
+     * @param transactionId The ID of the transaction
+     * @return All transaction details
+     */
+    function getTransaction(uint256 transactionId)
+        public
+        view
+        returns (
+            uint256 id,
+            address sender,
+            address recipient,
+            uint256 amount,
+            uint256 sourceChainId,
+            uint256 destinationChainId,
+            uint256 timestamp,
+            TransactionStatus status,
+            uint256 validations,
+            string memory transactionHash
+        )
+    {
+        BridgeTransaction memory transaction = transactions[transactionId];
+        require(transaction.transactionId == transactionId, "Transaction does not exist");
+        
+        return (
+            transaction.transactionId,
+            transaction.sender,
+            transaction.recipient,
+            transaction.amount,
+            transaction.sourceChainId,
+            transaction.destinationChainId,
+            transaction.timestamp,
+            transaction.status,
+            transaction.validations,
+            transaction.transactionHash
+        );
+    }
+    
+    /**
+     * @dev Pauses the contract
+     */
+    function pause() public onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpauses the contract
+     */
+    function unpause() public onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+    
+    /**
+     * @dev Function that should revert when `msg.sender` is not authorized to upgrade the contract
+     * @param newImplementation Address of the new implementation
+     */
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
+}

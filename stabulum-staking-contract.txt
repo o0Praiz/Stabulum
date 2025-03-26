@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+/**
+ * @title Stabulum Staking Contract
+ * @dev A contract for staking Stabulum tokens and earning rewards
+ */
+contract StabulumStaking is Ownable, ReentrancyGuard {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    // Stabulum token address
+    IERC20 public stabulum;
+    
+    // Reward token address (could be same as stabulum or a different token)
+    IERC20 public rewardToken;
+    
+    // Staking pool information
+    struct StakingPool {
+        uint256 rewardRate;           // Reward rate per second
+        uint256 lastUpdateTime;       // Last time the rewards were updated
+        uint256 rewardPerTokenStored; // Accumulated rewards per token
+        uint256 totalStaked;          // Total tokens staked in this pool
+        uint256 minimumStakeTime;     // Minimum time required to stake (in seconds)
+        bool active;                  // Whether the pool is active
+    }
+    
+    // User staking information
+    struct UserStakingInfo {
+        uint256 stakedAmount;            // Amount staked by the user
+        uint256 rewards;                 // Pending rewards
+        uint256 userRewardPerTokenPaid;  // User's last updated reward per token
+        uint256 lastStakeTime;           // Timestamp of the last stake
+    }
+    
+    // Array of staking pools
+    StakingPool[] public stakingPools;
+    
+    // Mapping from pool ID to user address to staking info
+    mapping(uint256 => mapping(address => UserStakingInfo)) public userStakingInfo;
+    
+    // Events
+    event Staked(address indexed user, uint256 indexed poolId, uint256 amount);
+    event Withdrawn(address indexed user, uint256 indexed poolId, uint256 amount);
+    event RewardPaid(address indexed user, uint256 indexed poolId, uint256 reward);
+    event PoolCreated(uint256 indexed poolId, uint256 rewardRate, uint256 minimumStakeTime);
+    event PoolUpdated(uint256 indexed poolId, uint256 rewardRate, bool active);
+    
+    /**
+     * @dev Constructor that initializes the staking contract with the Stabulum token and reward token addresses
+     * @param _stabulumToken The address of the Stabulum token (for staking)
+     * @param _rewardToken The address of the reward token (could be same as Stabulum)
+     */
+    constructor(address _stabulumToken, address _rewardToken) {
+        require(_stabulumToken != address(0), "Stabulum token cannot be zero address");
+        require(_rewardToken != address(0), "Reward token cannot be zero address");
+        stabulum = IERC20(_stabulumToken);
+        rewardToken = IERC20(_rewardToken);
+    }
+    
+    /**
+     * @notice Create a new staking pool
+     * @param _rewardRate Reward rate per second
+     * @param _minimumStakeTime Minimum time required to stake (in seconds)
+     */
+    function createPool(uint256 _rewardRate, uint256 _minimumStakeTime) external onlyOwner {
+        stakingPools.push(StakingPool({
+            rewardRate: _rewardRate,
+            lastUpdateTime: block.timestamp,
+            rewardPerTokenStored: 0,
+            totalStaked: 0,
+            minimumStakeTime: _minimumStakeTime,
+            active: true
+        }));
+        
+        emit PoolCreated(stakingPools.length - 1, _rewardRate, _minimumStakeTime);
+    }
+    
+    /**
+     * @notice Updates a staking pool's parameters
+     * @param _poolId ID of the pool to update
+     * @param _rewardRate New reward rate per second
+     * @param _active Whether the pool should be active
+     */
+    function updatePool(uint256 _poolId, uint256 _rewardRate, bool _active) external onlyOwner {
+        require(_poolId < stakingPools.length, "Invalid pool ID");
+        
+        updateReward(_poolId, address(0)); // Update rewards for everyone
+        
+        StakingPool storage pool = stakingPools[_poolId];
+        pool.rewardRate = _rewardRate;
+        pool.active = _active;
+        
+        emit PoolUpdated(_poolId, _rewardRate, _active);
+    }
+    
+    /**
+     * @notice Returns the number of available staking pools
+     * @return Number of staking pools
+     */
+    function getPoolCount() external view returns (uint256) {
+        return stakingPools.length;
+    }
+    
+    /**
+     * @notice Returns the reward per token for a specific pool
+     * @param _poolId ID of the pool
+     * @return Current reward per token
+     */
+    function rewardPerToken(uint256 _poolId) public view returns (uint256) {
+        require(_poolId < stakingPools.length, "Invalid pool ID");
+        
+        StakingPool storage pool = stakingPools[_poolId];
+        
+        if (pool.totalStaked == 0) {
+            return pool.rewardPerTokenStored;
+        }
+        
+        return pool.rewardPerTokenStored.add(
+            block.timestamp.sub(pool.lastUpdateTime).mul(pool.rewardRate).mul(1e18).div(pool.totalStaked)
+        );
+    }
+    
+    /**
+     * @notice Calculate the earned rewards for a user in a specific pool
+     * @param _poolId ID of the pool
+     * @param _user Address of the user
+     * @return Amount of rewards earned
+     */
+    function earned(uint256 _poolId, address _user) public view returns (uint256) {
+        require(_poolId < stakingPools.length, "Invalid pool ID");
+        
+        UserStakingInfo storage user = userStakingInfo[_poolId][_user];
+        
+        return user.stakedAmount.mul(
+            rewardPerToken(_poolId).sub(user.userRewardPerTokenPaid)
+        ).div(1e18).add(user.rewards);
+    }
+    
+    /**
+     * @notice Updates reward variables for a pool and user
+     * @param _poolId ID of the pool
+     * @param _user Address of the user (use address(0) to update only the pool)
+     */
+    function updateReward(uint256 _poolId, address _user) internal {
+        require(_poolId < stakingPools.length, "Invalid pool ID");
+        
+        StakingPool storage pool = stakingPools[_poolId];
+        pool.rewardPerTokenStored = rewardPerToken(_poolId);
+        pool.lastUpdateTime = block.timestamp;
+        
+        if (_user != address(0)) {
+            UserStakingInfo storage user = userStakingInfo[_poolId][_user];
+            user.rewards = earned(_poolId, _user);
+            user.userRewardPerTokenPaid = pool.rewardPerTokenStored;
+        }
+    }
+    
+    /**
+     * @notice Stake tokens in a specific pool
+     * @param _poolId ID of the pool
+     * @param _amount Amount of tokens to stake
+     */
+    function stake(uint256 _poolId, uint256 _amount) external nonReentrant {
+        require(_poolId < stakingPools.length, "Invalid pool ID");
+        require(_amount > 0, "Cannot stake 0");
+        
+        StakingPool storage pool = stakingPools[_poolId];
+        require(pool.active, "Pool is not active");
+        
+        updateReward(_poolId, msg.sender);
+        
+        UserStakingInfo storage user = userStakingInfo[_poolId][msg.sender];
+        
+        // Transfer tokens from user to contract
+        stabulum.safeTransferFrom(msg.sender, address(this), _amount);
+        
+        user.stakedAmount = user.stakedAmount.add(_amount);
+        user.lastStakeTime = block.timestamp;
+        pool.totalStaked = pool.totalStaked.add(_amount);
+        
+        emit Staked(msg.sender, _poolId, _amount);
+    }
+    
+    /**
+     * @notice Withdraw staked tokens from a specific pool
+     * @param _poolId ID of the pool
+     * @param _amount Amount of tokens to withdraw
+     */
+    function withdraw(uint256 _poolId, uint256 _amount) external nonReentrant {
+        require(_poolId < stakingPools.length, "Invalid pool ID");
+        require(_amount > 0, "Cannot withdraw 0");
+        
+        StakingPool storage pool = stakingPools[_poolId];
+        UserStakingInfo storage user = userStakingInfo[_poolId][msg.sender];
+        
+        require(user.stakedAmount >= _amount, "Not enough staked tokens");
+        require(
+            block.timestamp >= user.lastStakeTime + pool.minimumStakeTime,
+            "Minimum stake time not reached"
+        );
+        
+        updateReward(_poolId, msg.sender);
+        
+        user.stakedAmount = user.stakedAmount.sub(_amount);
+        pool.totalStaked = pool.totalStaked.sub(_amount);
+        
+        // Transfer tokens back to user
+        stabulum.safeTransfer(msg.sender, _amount);
+        
+        emit Withdrawn(msg.sender, _poolId, _amount);
+    }
+    
+    /**
+     * @notice Claim accumulated rewards from a specific pool
+     * @param _poolId ID of the pool
+     */
+    function claimReward(uint256 _poolId) external nonReentrant {
+        require(_poolId < stakingPools.length, "Invalid pool ID");
+        
+        updateReward(_poolId, msg.sender);
+        
+        UserStakingInfo storage user = userStakingInfo[_poolId][msg.sender];
+        uint256 reward = user.rewards;
+        
+        if (reward > 0) {
+            user.rewards = 0;
+            
+            // Transfer reward tokens to user
+            rewardToken.safeTransfer(msg.sender, reward);
+            
+            emit RewardPaid(msg.sender, _poolId, reward);
+        }
+    }
+    
+    /**
+     * @notice Exit a pool by withdrawing all tokens and claiming rewards
+     * @param _poolId ID of the pool
+     */
+    function exit(uint256 _poolId) external {
+        require(_poolId < stakingPools.length, "Invalid pool ID");
+        
+        UserStakingInfo storage user = userStakingInfo[_poolId][msg.sender];
+        uint256 stakedAmount = user.stakedAmount;
+        
+        if (stakedAmount > 0) {
+            withdraw(_poolId, stakedAmount);
+        }
+        
+        claimReward(_poolId);
+    }
+    
+    /**
+     * @notice Function to add rewards to the contract (callable by owner)
+     * @param _amount Amount of reward tokens to add
+     */
+    function addRewards(uint256 _amount) external onlyOwner {
+        require(_amount > 0, "Amount must be greater than zero");
+        rewardToken.safeTransferFrom(msg.sender, address(this), _amount);
+    }
+    
+    /**
+     * @notice Emergency withdraw function in case of issues (callable by owner)
+     * @param _token Address of the token to withdraw
+     * @param _amount Amount to withdraw
+     */
+    function emergencyWithdraw(address _token, uint256 _amount) external onlyOwner {
+        IERC20(_token).safeTransfer(owner(), _amount);
+    }
+}

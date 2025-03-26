@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+// Interface for interacting with external protocols
+interface IExternalProtocol {
+    function deposit(uint256 amount) external returns (uint256);
+    function withdraw(uint256 amount) external returns (uint256);
+    function claimRewards() external returns (uint256);
+}
+
+/**
+ * @title Stabulum DeFi Integration Contract
+ * @dev A contract for integrating Stabulum with various DeFi protocols
+ */
+contract StabulumDeFiIntegration is Ownable, ReentrancyGuard {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    // Stabulum token address
+    IERC20 public stabulum;
+    
+    // Protocol information
+    struct Protocol {
+        address protocolAddress;     // Address of the protocol contract
+        address receiptToken;        // Address of the receipt token received when depositing
+        bool active;                 // Whether the protocol is active
+        string name;                 // Name of the protocol
+        uint256 totalDeposited;      // Total amount deposited to this protocol
+        uint256 protocolFee;         // Fee charged by this protocol (in basis points, e.g. 30 = 0.3%)
+        uint256 platformFee;         // Fee charged by Stabulum platform (in basis points)
+    }
+    
+    // User deposit information
+    struct UserDeposit {
+        uint256 depositAmount;      // Amount deposited by user
+        uint256 sharePercentage;    // User's share of the pool (in basis points)
+    }
+    
+    // Array of integrated protocols
+    Protocol[] public protocols;
+    
+    // Mapping from protocol ID to user address to deposit info
+    mapping(uint256 => mapping(address => UserDeposit)) public userDeposits;
+    
+    // Fee collector address
+    address public feeCollector;
+    
+    // Events
+    event ProtocolAdded(uint256 indexed protocolId, address protocolAddress, string name);
+    event ProtocolUpdated(uint256 indexed protocolId, bool active, uint256 protocolFee, uint256 platformFee);
+    event Deposited(address indexed user, uint256 indexed protocolId, uint256 amount);
+    event Withdrawn(address indexed user, uint256 indexed protocolId, uint256 amount, uint256 fee);
+    event RewardClaimed(address indexed user, uint256 indexed protocolId, uint256 amount);
+    event FeeCollectorUpdated(address indexed previousCollector, address indexed newCollector);
+    
+    /**
+     * @dev Constructor that initializes the DeFi integration contract with the Stabulum token address
+     * @param _stabulumToken The address of the Stabulum token
+     * @param _feeCollector The address that will collect platform fees
+     */
+    constructor(address _stabulumToken, address _feeCollector) {
+        require(_stabulumToken != address(0), "Stabulum token cannot be zero address");
+        require(_feeCollector != address(0), "Fee collector cannot be zero address");
+        stabulum = IERC20(_stabulumToken);
+        feeCollector = _feeCollector;
+    }
+    
+    /**
+     * @notice Add a new DeFi protocol integration
+     * @param _protocolAddress Address of the protocol contract
+     * @param _receiptToken Address of the receipt token received when depositing
+     * @param _name Name of the protocol
+     * @param _protocolFee Fee charged by this protocol (in basis points)
+     * @param _platformFee Fee charged by Stabulum platform (in basis points)
+     */
+    function addProtocol(
+        address _protocolAddress,
+        address _receiptToken,
+        string memory _name,
+        uint256 _protocolFee,
+        uint256 _platformFee
+    ) external onlyOwner {
+        require(_protocolAddress != address(0), "Protocol address cannot be zero");
+        require(_protocolFee <= 1000, "Protocol fee cannot exceed 10%"); // 1000 basis points = 10%
+        require(_platformFee <= 500, "Platform fee cannot exceed 5%"); // 500 basis points = 5%
+        
+        protocols.push(Protocol({
+            protocolAddress: _protocolAddress,
+            receiptToken: _receiptToken,
+            active: true,
+            name: _name,
+            totalDeposited: 0,
+            protocolFee: _protocolFee,
+            platformFee: _platformFee
+        }));
+        
+        emit ProtocolAdded(protocols.length - 1, _protocolAddress, _name);
+    }
+    
+    /**
+     * @notice Update an existing protocol's parameters
+     * @param _protocolId ID of the protocol to update
+     * @param _active Whether the protocol should be active
+     * @param _protocolFee New fee charged by this protocol (in basis points)
+     * @param _platformFee New fee charged by Stabulum platform (in basis points)
+     */
+    function updateProtocol(
+        uint256 _protocolId,
+        bool _active,
+        uint256 _protocolFee,
+        uint256 _platformFee
+    ) external onlyOwner {
+        require(_protocolId < protocols.length, "Invalid protocol ID");
+        require(_protocolFee <= 1000, "Protocol fee cannot exceed 10%");
+        require(_platformFee <= 500, "Platform fee cannot exceed 5%");
+        
+        Protocol storage protocol = protocols[_protocolId];
+        protocol.active = _active;
+        protocol.protocolFee = _protocolFee;
+        protocol.platformFee = _platformFee;
+        
+        emit ProtocolUpdated(_protocolId, _active, _protocolFee, _platformFee);
+    }
+    
+    /**
+     * @notice Returns the number of integrated protocols
+     * @return Number of protocols
+     */
+    function getProtocolCount() external view returns (uint256) {
+        return protocols.length;
+    }
+    
+    /**
+     * @notice Deposit Stabulum tokens into a specific protocol
+     * @param _protocolId ID of the protocol
+     * @param _amount Amount of tokens to deposit
+     */
+    function deposit(uint256 _protocolId, uint256 _amount) external nonReentrant {
+        require(_protocolId < protocols.length, "Invalid protocol ID");
+        require(_amount > 0, "Cannot deposit 0");
+        
+        Protocol storage protocol = protocols[_protocolId];
+        require(protocol.active, "Protocol is not active");
+        
+        UserDeposit storage userDeposit = userDeposits[_protocolId][msg.sender];
+        
+        // Transfer tokens from user to contract
+        stabulum.safeTransferFrom(msg.sender, address(this), _amount);
+        
+        // Approve the protocol to spend tokens
+        stabulum.approve(protocol.protocolAddress, _amount);
+        
+        // Deposit to the external protocol
+        IExternalProtocol(protocol.protocolAddress).deposit(_amount);
+        
+        // Update user deposit information
+        userDeposit.depositAmount = userDeposit.depositAmount.add(_amount);
+        
+        // Update total deposited for this protocol
+        protocol.totalDeposited = protocol.totalDeposited.add(_amount);
+        
+        // Calculate user's share percentage
+        userDeposit.sharePercentage = userDeposit.depositAmount.mul(10000).div(protocol.totalDeposited);
+        
+        emit Deposited(msg.sender, _protocolId, _amount);
+    }
+    
+    /**
+     * @notice Withdraw Stabulum tokens from a specific protocol
+     * @param _protocolId ID of the protocol
+     * @param _amount Amount of tokens to withdraw
+     */
+    function withdraw(uint256 _protocolId, uint256 _amount) external nonReentrant {
+        require(_protocolId < protocols.length, "Invalid protocol ID");
+        require(_amount > 0, "Cannot withdraw 0");
+        
+        Protocol storage protocol = protocols[_protocolId];
+        UserDeposit storage userDeposit = userDeposits[_protocolId][msg.sender];
+        
+        require(userDeposit.depositAmount >= _amount, "Insufficient deposit balance");
+        
+        // Withdraw from the external protocol
+        IExternalProtocol(protocol.protocolAddress).withdraw(_amount);
+        
+        // Calculate fees
+        uint256 protocolFeeAmount = _amount.mul(protocol.protocolFee).div(10000);
+        uint256 platformFeeAmount = _amount.mul(protocol.platformFee).div(10000);
+        uint256 totalFee = protocolFeeAmount.add(platformFeeAmount);
+        uint256 amountAfterFees = _amount.sub(totalFee);
+        
+        // Update user deposit information
+        userDeposit.depositAmount = userDeposit.depositAmount.sub(_amount);
+        
+        // Update total deposited for this protocol
+        protocol.totalDeposited = protocol.totalDeposited.sub(_amount);
+        
+        // Update user's share percentage if they still have deposits
+        if (userDeposit.depositAmount > 0 && protocol.totalDeposited > 0) {
+            userDeposit.sharePercentage = userDeposit.depositAmount.mul(10000).div(protocol.totalDeposited);
+        } else {
+            userDeposit.sharePercentage = 0;
+        }
+        
+        // Transfer platform fee to fee collector
+        if (platformFeeAmount > 0) {
+            stabulum.safeTransfer(feeCollector, platformFeeAmount);
+        }
+        
+        // Transfer remaining amount to user
+        stabulum.safeTransfer(msg.sender, amountAfterFees);
+        
+        emit Withdrawn(msg.sender, _protocolId, _amount, totalFee);
+    }
+    
+    /**
+     * @notice Claim rewards from a specific protocol
+     * @param _protocolId ID of the protocol
+     */
+    function claimRewards(uint256 _protocolId) external nonReentrant {
+        require(_protocolId < protocols.length, "Invalid protocol ID");
+        
+        Protocol storage protocol = protocols[_protocolId];
+        UserDeposit storage userDeposit = userDeposits[_protocolId][msg.sender];
+        
+        require(userDeposit.depositAmount > 0, "No deposits found");
+        
+        // Claim rewards from the external protocol
+        uint256 totalRewards = IExternalProtocol(protocol.protocolAddress).claimRewards();
+        
+        // Calculate user's portion of rewards based on their share
+        uint256 userRewards = totalRewards.mul(userDeposit.sharePercentage).div(10000);
+        
+        // Transfer rewards to user
+        if (userRewards > 0) {
+            // Assuming rewards are in the same token as stabulum
+            stabulum.safeTransfer(msg.sender, userRewards);
+        }
+        
+        emit RewardClaimed(msg.sender, _protocolId, userRewards);
+    }
+    
+    /**
+     * @notice Update the fee collector address
+     * @param _newFeeCollector New address for fee collection
+     */
+    function updateFeeCollector(address _newFeeCollector) external onlyOwner {
+        require(_newFeeCollector != address(0), "Fee collector cannot be zero address");
+        
+        address oldFeeCollector = feeCollector;
+        feeCollector = _newFeeCollector;
+        
+        emit FeeCollectorUpdated(oldFeeCollector, _newFeeCollector);
+    }
+    
+    /**
+     * @notice Get user deposit information for a specific protocol
+     * @param _protocolId ID of the protocol
+     * @param _user Address of the user
+     * @return User's deposit amount and share percentage
+     */
+    function getUserDeposit(uint256 _protocolId, address _user) external view returns (uint256, uint256) {
+        require(_protocolId < protocols.length, "Invalid protocol ID");
+        
+        UserDeposit storage userDeposit = userDeposits[_protocolId][_user];
+        return (userDeposit.depositAmount, userDeposit.sharePercentage);
+    }
+    
+    /**
+     * @notice Emergency withdraw function in case of protocol issues
+     * @param _protocolId ID of the protocol
+     * @param _token Address of the token to withdraw
+     * @param _amount Amount to withdraw
+     */
+    function emergencyWithdraw(uint256 _protocolId, address _token, uint256 _amount) external onlyOwner {
+        require(_protocolId < protocols.length, "Invalid protocol ID");
+        
+        IERC20(_token).safeTransfer(owner(), _amount);
+    }
+}

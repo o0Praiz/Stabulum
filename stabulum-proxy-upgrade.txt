@@ -1,0 +1,158 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
+import "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+
+/**
+ * @title StabulumProxyAdmin
+ * @dev Custom proxy admin for Stabulum contracts with role-based access control
+ */
+contract StabulumProxyAdmin is ProxyAdmin, AccessControl {
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant EMERGENCY_ADMIN_ROLE = keccak256("EMERGENCY_ADMIN_ROLE");
+    
+    // Upgrade timelock
+    uint256 public upgradeTimelock;
+    uint256 public constant MIN_TIMELOCK = 24 hours;
+    uint256 public constant MAX_TIMELOCK = 30 days;
+    
+    // Pending upgrades
+    struct PendingUpgrade {
+        address proxy;
+        address implementation;
+        bytes data;
+        uint256 timestamp;
+        bool executed;
+        bool canceled;
+    }
+    
+    mapping(uint256 => PendingUpgrade) public pendingUpgrades;
+    uint256 public nextUpgradeId;
+    
+    // Events
+    event UpgradeScheduled(uint256 indexed upgradeId, address indexed proxy, address indexed implementation, uint256 timestamp);
+    event UpgradeExecuted(uint256 indexed upgradeId, address indexed proxy, address indexed implementation);
+    event UpgradeCanceled(uint256 indexed upgradeId);
+    event TimelockUpdated(uint256 newTimelock);
+    event EmergencyUpgradeExecuted(address indexed proxy, address indexed implementation);
+    
+    constructor(uint256 _upgradeTimelock) {
+        require(_upgradeTimelock >= MIN_TIMELOCK && _upgradeTimelock <= MAX_TIMELOCK, "Invalid timelock");
+        upgradeTimelock = _upgradeTimelock;
+        
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(UPGRADER_ROLE, msg.sender);
+        _setupRole(EMERGENCY_ADMIN_ROLE, msg.sender);
+        
+        nextUpgradeId = 1;
+    }
+    
+    /**
+     * @dev Schedule an upgrade for a proxy contract
+     * @param proxy Address of the TransparentUpgradeableProxy
+     * @param implementation Address of the new implementation contract
+     * @param data Data to be passed to the implementation during the upgrade
+     * @return upgradeId The ID of the scheduled upgrade
+     */
+    function scheduleUpgrade(
+        TransparentUpgradeableProxy proxy,
+        address implementation,
+        bytes memory data
+    ) external onlyRole(UPGRADER_ROLE) returns (uint256) {
+        require(address(proxy) != address(0), "Invalid proxy address");
+        require(implementation != address(0), "Invalid implementation address");
+        
+        uint256 upgradeId = nextUpgradeId++;
+        pendingUpgrades[upgradeId] = PendingUpgrade({
+            proxy: address(proxy),
+            implementation: implementation,
+            data: data,
+            timestamp: block.timestamp + upgradeTimelock,
+            executed: false,
+            canceled: false
+        });
+        
+        emit UpgradeScheduled(upgradeId, address(proxy), implementation, block.timestamp + upgradeTimelock);
+        
+        return upgradeId;
+    }
+    
+    /**
+     * @dev Execute a scheduled upgrade
+     * @param upgradeId ID of the scheduled upgrade
+     */
+    function executeUpgrade(uint256 upgradeId) external onlyRole(UPGRADER_ROLE) {
+        require(upgradeId < nextUpgradeId, "Invalid upgrade ID");
+        PendingUpgrade storage upgrade = pendingUpgrades[upgradeId];
+        
+        require(!upgrade.executed, "Upgrade already executed");
+        require(!upgrade.canceled, "Upgrade was canceled");
+        require(block.timestamp >= upgrade.timestamp, "Timelock not expired");
+        
+        upgrade.executed = true;
+        
+        TransparentUpgradeableProxy proxy = TransparentUpgradeableProxy(payable(upgrade.proxy));
+        bytes memory data = upgrade.data;
+        
+        if (data.length > 0) {
+            upgradeAndCall(proxy, upgrade.implementation, data);
+        } else {
+            upgrade(proxy, upgrade.implementation);
+        }
+        
+        emit UpgradeExecuted(upgradeId, upgrade.proxy, upgrade.implementation);
+    }
+    
+    /**
+     * @dev Cancel a scheduled upgrade
+     * @param upgradeId ID of the scheduled upgrade
+     */
+    function cancelUpgrade(uint256 upgradeId) external onlyRole(UPGRADER_ROLE) {
+        require(upgradeId < nextUpgradeId, "Invalid upgrade ID");
+        PendingUpgrade storage upgrade = pendingUpgrades[upgradeId];
+        
+        require(!upgrade.executed, "Upgrade already executed");
+        require(!upgrade.canceled, "Upgrade already canceled");
+        
+        upgrade.canceled = true;
+        
+        emit UpgradeCanceled(upgradeId);
+    }
+    
+    /**
+     * @dev Update the timelock duration
+     * @param _upgradeTimelock New timelock duration in seconds
+     */
+    function updateTimelock(uint256 _upgradeTimelock) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_upgradeTimelock >= MIN_TIMELOCK && _upgradeTimelock <= MAX_TIMELOCK, "Invalid timelock");
+        upgradeTimelock = _upgradeTimelock;
+        
+        emit TimelockUpdated(_upgradeTimelock);
+    }
+    
+    /**
+     * @dev Execute an emergency upgrade bypassing the timelock
+     * @param proxy Address of the TransparentUpgradeableProxy
+     * @param implementation Address of the new implementation contract
+     */
+    function emergencyUpgrade(
+        TransparentUpgradeableProxy proxy,
+        address implementation
+    ) external onlyRole(EMERGENCY_ADMIN_ROLE) {
+        require(address(proxy) != address(0), "Invalid proxy address");
+        require(implementation != address(0), "Invalid implementation address");
+        
+        upgrade(proxy, implementation);
+        
+        emit EmergencyUpgradeExecuted(address(proxy), implementation);
+    }
+    
+    /**
+     * @dev Override owner function to use access control
+     */
+    function owner() public view override returns (address) {
+        return hasRole(DEFAULT_ADMIN_ROLE, msg.sender) ? msg.sender : address(0);
+    }
+}

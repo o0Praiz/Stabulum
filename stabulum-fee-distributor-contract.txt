@@ -1,0 +1,277 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title StabulumFeeDistributor
+ * @dev Contract for collecting and distributing fees from Stabulum operations
+ * Fees are collected from various operations and distributed to different stakeholders
+ * including reserve fund, development fund, and governance stakers
+ */
+contract StabulumFeeDistributor is AccessControl, ReentrancyGuard, Pausable {
+    bytes32 public constant FEE_MANAGER_ROLE = keccak256("FEE_MANAGER_ROLE");
+    bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
+
+    // Stabulum token address
+    IERC20 public stabulumToken;
+    
+    // Fee distribution percentages (basis points: 1/100 of a percent, 10000 = 100%)
+    uint256 public reserveFundShare = 5000;    // 50% to reserve fund by default
+    uint256 public developmentFundShare = 3000; // 30% to development fund by default
+    uint256 public governanceStakersShare = 2000; // 20% to governance stakers by default
+
+    // Address of the reserve fund contract
+    address public reserveFundAddress;
+    
+    // Address of the development fund
+    address public developmentFundAddress;
+    
+    // Address of the governance staking contract
+    address public governanceStakingAddress;
+
+    // Fee collection tracking
+    uint256 public totalFeesCollected;
+    uint256 public lastDistributionTimestamp;
+    uint256 public undistributedFees;
+    
+    // Fee types and their rates in basis points (1/100 of a percent, 10000 = 100%)
+    mapping(bytes32 => uint256) public feeRates;
+    
+    // Events
+    event FeeCollected(bytes32 feeType, uint256 amount, address from);
+    event FeesDistributed(uint256 reserveAmount, uint256 developmentAmount, uint256 stakersAmount);
+    event FeeRateUpdated(bytes32 feeType, uint256 newRate);
+    event SharesUpdated(uint256 reserveShare, uint256 developmentShare, uint256 stakersShare);
+    event AddressUpdated(string addressType, address oldAddress, address newAddress);
+
+    /**
+     * @dev Constructor initializes the contract with required addresses
+     * @param _stabulumToken Address of the Stabulum token
+     * @param _reserveFundAddress Address of the reserve fund
+     * @param _developmentFundAddress Address of the development fund
+     * @param _governanceStakingAddress Address of the governance staking contract
+     */
+    constructor(
+        address _stabulumToken,
+        address _reserveFundAddress,
+        address _developmentFundAddress,
+        address _governanceStakingAddress
+    ) {
+        require(_stabulumToken != address(0), "Invalid Stabulum token address");
+        require(_reserveFundAddress != address(0), "Invalid reserve fund address");
+        require(_developmentFundAddress != address(0), "Invalid development fund address");
+        require(_governanceStakingAddress != address(0), "Invalid governance staking address");
+        
+        stabulumToken = IERC20(_stabulumToken);
+        reserveFundAddress = _reserveFundAddress;
+        developmentFundAddress = _developmentFundAddress;
+        governanceStakingAddress = _governanceStakingAddress;
+        
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(FEE_MANAGER_ROLE, msg.sender);
+        _setupRole(GOVERNANCE_ROLE, msg.sender);
+        
+        lastDistributionTimestamp = block.timestamp;
+        
+        // Set default fee rates
+        feeRates[keccak256("TRANSFER")] = 10;         // 0.1% fee on transfers
+        feeRates[keccak256("MINTING")] = 20;          // 0.2% fee on minting
+        feeRates[keccak256("REDEMPTION")] = 30;       // 0.3% fee on redemption
+        feeRates[keccak256("EXCHANGE")] = 15;         // 0.15% fee on exchange
+        feeRates[keccak256("CROSS_CHAIN")] = 50;      // 0.5% fee on cross-chain transfers
+    }
+    
+    /**
+     * @dev Modifier to check if total shares equal 10000 (100%)
+     */
+    modifier validShares(uint256 _reserveShare, uint256 _developmentShare, uint256 _stakersShare) {
+        require(_reserveShare + _developmentShare + _stakersShare == 10000, "Shares must sum to 100%");
+        _;
+    }
+    
+    /**
+     * @dev Collects fees from various operations
+     * @param feeType Type of fee being collected
+     * @param amount Amount being transacted
+     * @param from Address the fee is being collected from
+     * @return The amount of fee collected
+     */
+    function collectFee(bytes32 feeType, uint256 amount, address from) 
+        external 
+        onlyRole(FEE_MANAGER_ROLE) 
+        whenNotPaused 
+        returns (uint256)
+    {
+        uint256 feeRate = feeRates[feeType];
+        uint256 feeAmount = (amount * feeRate) / 10000;
+        
+        if (feeAmount > 0) {
+            // Transfer fee to this contract
+            require(stabulumToken.transferFrom(from, address(this), feeAmount), "Fee transfer failed");
+            
+            totalFeesCollected += feeAmount;
+            undistributedFees += feeAmount;
+            
+            emit FeeCollected(feeType, feeAmount, from);
+        }
+        
+        return feeAmount;
+    }
+    
+    /**
+     * @dev Distributes collected fees to stakeholders
+     * @return success Boolean indicating if distribution was successful
+     */
+    function distributeFees() 
+        external 
+        onlyRole(FEE_MANAGER_ROLE) 
+        nonReentrant 
+        whenNotPaused 
+        returns (bool)
+    {
+        require(undistributedFees > 0, "No fees to distribute");
+        
+        uint256 reserveAmount = (undistributedFees * reserveFundShare) / 10000;
+        uint256 developmentAmount = (undistributedFees * developmentFundShare) / 10000;
+        uint256 stakersAmount = (undistributedFees * governanceStakersShare) / 10000;
+        
+        // Reset undistributed fees before transfers to prevent reentrancy issues
+        uint256 amountToDistribute = undistributedFees;
+        undistributedFees = 0;
+        
+        // Transfer to reserve fund
+        if (reserveAmount > 0) {
+            require(stabulumToken.transfer(reserveFundAddress, reserveAmount), "Reserve transfer failed");
+        }
+        
+        // Transfer to development fund
+        if (developmentAmount > 0) {
+            require(stabulumToken.transfer(developmentFundAddress, developmentAmount), "Development transfer failed");
+        }
+        
+        // Transfer to governance stakers
+        if (stakersAmount > 0) {
+            require(stabulumToken.transfer(governanceStakingAddress, stakersAmount), "Stakers transfer failed");
+        }
+        
+        lastDistributionTimestamp = block.timestamp;
+        
+        emit FeesDistributed(reserveAmount, developmentAmount, stakersAmount);
+        
+        return true;
+    }
+    
+    /**
+     * @dev Updates fee rate for a specific operation
+     * @param feeType Type of fee being updated
+     * @param newRate New fee rate in basis points (1/100 of a percent)
+     */
+    function updateFeeRate(bytes32 feeType, uint256 newRate) 
+        external 
+        onlyRole(GOVERNANCE_ROLE)
+    {
+        require(newRate <= 1000, "Fee rate cannot exceed 10%");
+        feeRates[feeType] = newRate;
+        emit FeeRateUpdated(feeType, newRate);
+    }
+    
+    /**
+     * @dev Updates the distribution shares for different stakeholders
+     * @param _reserveShare New share for reserve fund in basis points
+     * @param _developmentShare New share for development fund in basis points
+     * @param _stakersShare New share for governance stakers in basis points
+     */
+    function updateShares(
+        uint256 _reserveShare, 
+        uint256 _developmentShare, 
+        uint256 _stakersShare
+    ) 
+        external 
+        onlyRole(GOVERNANCE_ROLE) 
+        validShares(_reserveShare, _developmentShare, _stakersShare)
+    {
+        reserveFundShare = _reserveShare;
+        developmentFundShare = _developmentShare;
+        governanceStakersShare = _stakersShare;
+        
+        emit SharesUpdated(_reserveShare, _developmentShare, _stakersShare);
+    }
+    
+    /**
+     * @dev Updates the reserve fund address
+     * @param newAddress New address for the reserve fund
+     */
+    function updateReserveFundAddress(address newAddress) 
+        external 
+        onlyRole(GOVERNANCE_ROLE)
+    {
+        require(newAddress != address(0), "Invalid address");
+        address oldAddress = reserveFundAddress;
+        reserveFundAddress = newAddress;
+        emit AddressUpdated("ReserveFund", oldAddress, newAddress);
+    }
+    
+    /**
+     * @dev Updates the development fund address
+     * @param newAddress New address for the development fund
+     */
+    function updateDevelopmentFundAddress(address newAddress) 
+        external 
+        onlyRole(GOVERNANCE_ROLE)
+    {
+        require(newAddress != address(0), "Invalid address");
+        address oldAddress = developmentFundAddress;
+        developmentFundAddress = newAddress;
+        emit AddressUpdated("DevelopmentFund", oldAddress, newAddress);
+    }
+    
+    /**
+     * @dev Updates the governance staking address
+     * @param newAddress New address for the governance staking contract
+     */
+    function updateGovernanceStakingAddress(address newAddress) 
+        external 
+        onlyRole(GOVERNANCE_ROLE)
+    {
+        require(newAddress != address(0), "Invalid address");
+        address oldAddress = governanceStakingAddress;
+        governanceStakingAddress = newAddress;
+        emit AddressUpdated("GovernanceStaking", oldAddress, newAddress);
+    }
+    
+    /**
+     * @dev Pauses the contract
+     */
+    function pause() external onlyRole(GOVERNANCE_ROLE) {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpauses the contract
+     */
+    function unpause() external onlyRole(GOVERNANCE_ROLE) {
+        _unpause();
+    }
+    
+    /**
+     * @dev Recovers tokens accidentally sent to the contract
+     * @param tokenAddress Address of the token to recover
+     * @param amount Amount to recover
+     */
+    function recoverTokens(address tokenAddress, uint256 amount) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        // Prevent recovering undistributed fees
+        if (tokenAddress == address(stabulumToken)) {
+            require(amount <= IERC20(tokenAddress).balanceOf(address(this)) - undistributedFees, 
+                "Cannot recover undistributed fees");
+        }
+        
+        IERC20(tokenAddress).transfer(msg.sender, amount);
+    }
+}

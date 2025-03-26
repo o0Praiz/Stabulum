@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+/**
+ * @title StabulumGasOptimizer
+ * @dev Gas optimization layer for Stabulum transactions
+ * Implements meta-transactions and batching to reduce gas costs
+ */
+contract StabulumGasOptimizer is AccessControl, ReentrancyGuard {
+    using SafeMath for uint256;
+    
+    bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
+    
+    // Stabulum token
+    IERC20 public stabulum;
+    
+    // Mapping of user nonces for meta-transactions
+    mapping(address => uint256) public nonces;
+    
+    // Domain separator for EIP-712
+    bytes32 public DOMAIN_SEPARATOR;
+    
+    // EIP-712 type hash for transfers
+    bytes32 public constant TRANSFER_TYPEHASH = 
+        keccak256("Transfer(address from,address to,uint256 amount,uint256 nonce,uint256 deadline)");
+    
+    // Events
+    event MetaTransferExecuted(address indexed from, address indexed to, uint256 amount, uint256 nonce);
+    event BatchTransferExecuted(address indexed from, address[] to, uint256[] amounts);
+    event RelayerAdded(address indexed relayer);
+    event RelayerRemoved(address indexed relayer);
+    
+    constructor(address _stabulum) {
+        require(_stabulum != address(0), "Invalid Stabulum address");
+        stabulum = IERC20(_stabulum);
+        
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(RELAYER_ROLE, msg.sender);
+        
+        uint256 chainId;
+        assembly {
+            chainId := chainid()
+        }
+        
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("Stabulum Gas Optimizer")),
+                keccak256(bytes("1")),
+                chainId,
+                address(this)
+            )
+        );
+    }
+    
+    /**
+     * @dev Add a new relayer
+     * @param relayer Address of the relayer
+     */
+    function addRelayer(address relayer) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(relayer != address(0), "Invalid relayer address");
+        grantRole(RELAYER_ROLE, relayer);
+        emit RelayerAdded(relayer);
+    }
+    
+    /**
+     * @dev Remove a relayer
+     * @param relayer Address of the relayer
+     */
+    function removeRelayer(address relayer) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        revokeRole(RELAYER_ROLE, relayer);
+        emit RelayerRemoved(relayer);
+    }
+    
+    /**
+     * @dev Execute a meta-transaction (gasless transfer)
+     * @param from Address of the sender
+     * @param to Address of the recipient
+     * @param amount Amount to transfer
+     * @param deadline Deadline for the transaction
+     * @param v v component of the signature
+     * @param r r component of the signature
+     * @param s s component of the signature
+     */
+    function executeMetaTransfer(
+        address from,
+        address to,
+        uint256 amount,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external onlyRole(RELAYER_ROLE) nonReentrant {
+        require(block.timestamp <= deadline, "Transaction expired");
+        require(to != address(0), "Invalid recipient");
+        
+        uint256 nonce = nonces[from]++;
+        
+        bytes32 structHash = keccak256(
+            abi.encode(
+                TRANSFER_TYPEHASH,
+                from,
+                to,
+                amount,
+                nonce,
+                deadline
+            )
+        );
+        
+        bytes32 hash = keccak256(
+            abi.encodePacked(
+                "\x19\x01",
+                DOMAIN_SEPARATOR,
+                structHash
+            )
+        );
+        
+        address signer = ecrecover(hash, v, r, s);
+        require(signer == from, "Invalid signature");
+        
+        // Execute the transfer
+        bool success = stabulum.transferFrom(from, to, amount);
+        require(success, "Transfer failed");
+        
+        emit MetaTransferExecuted(from, to, amount, nonce);
+    }
+    
+    /**
+     * @dev Execute a batch transfer
+     * @param from Address of the sender
+     * @param to Array of recipient addresses
+     * @param amounts Array of amounts to transfer
+     */
+    function executeBatchTransfer(
+        address from,
+        address[] calldata to,
+        uint256[] calldata amounts
+    ) external nonReentrant {
+        require(to.length == amounts.length, "Arrays length mismatch");
+        require(to.length > 0, "Empty arrays");
+        require(from == msg.sender || hasRole(RELAYER_ROLE, msg.sender), "Unauthorized");
+        
+        uint256 totalAmount = 0;
+        
+        for (uint256 i = 0; i < amounts.length; i++) {
+            require(to[i] != address(0), "Invalid recipient");
+            totalAmount = totalAmount.add(amounts[i]);
+        }
+        
+        // Transfer tokens from sender to this contract
+        bool success = stabulum.transferFrom(from, address(this), totalAmount);
+        require(success, "Transfer to contract failed");
+        
+        // Distribute tokens to recipients
+        for (uint256 i = 0; i < to.length; i++) {
+            success = stabulum.transfer(to[i], amounts[i]);
+            require(success, "Transfer to recipient failed");
+        }
+        
+        emit BatchTransferExecuted(from, to, amounts);
+    }
+    
+    /**
+     * @dev Get the current nonce for a user
+     * @param user Address of the user
+     * @return nonce Current nonce
+     */
+    function getNonce(address user) external view returns (uint256) {
+        return nonces[user];
+    }
+    
+    /**
+     * @dev Recover any ERC20 tokens accidentally sent to this contract
+     * @param token Address of the token
+     * @param to Address to send the tokens to
+     * @param amount Amount to recover
+     */
+    function recoverERC20(address token, address to, uint256 amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(to != address(0), "Invalid recipient");
+        IERC20(token).transfer(to, amount);
+    }
+}

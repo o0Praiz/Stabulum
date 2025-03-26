@@ -1,0 +1,119 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+
+/**
+ * @title Stabulum Airdrop Contract
+ * @dev A contract for distributing Stabulum tokens via an airdrop using a Merkle tree for efficient verification
+ */
+contract StabulumAirdrop is Ownable, ReentrancyGuard {
+    // Stabulum token address
+    IERC20 public stabulum;
+    
+    // Merkle root for airdrop verification
+    bytes32 public merkleRoot;
+    
+    // Mapping from address to boolean to track if an address has already claimed
+    mapping(address => bool) public hasClaimed;
+    
+    // Event for when an airdrop is claimed
+    event AirdropClaimed(address indexed recipient, uint256 amount);
+    
+    // Event for when the Merkle root is updated
+    event MerkleRootUpdated(bytes32 newMerkleRoot);
+    
+    /**
+     * @dev Constructor that initializes the airdrop contract with the Stabulum token address and Merkle root
+     * @param _stabulumToken The address of the Stabulum token
+     * @param _merkleRoot The Merkle root for verifying claims
+     */
+    constructor(address _stabulumToken, bytes32 _merkleRoot) {
+        require(_stabulumToken != address(0), "Stabulum token cannot be zero address");
+        stabulum = IERC20(_stabulumToken);
+        merkleRoot = _merkleRoot;
+    }
+    
+    /**
+     * @notice Update the Merkle root (for updating the airdrop list)
+     * @param _newMerkleRoot The new Merkle root
+     */
+    function updateMerkleRoot(bytes32 _newMerkleRoot) external onlyOwner {
+        merkleRoot = _newMerkleRoot;
+        emit MerkleRootUpdated(_newMerkleRoot);
+    }
+    
+    /**
+     * @notice Claim airdrop tokens
+     * @param _amount The amount of tokens to claim
+     * @param _merkleProof The Merkle proof proving the claim is valid
+     */
+    function claim(uint256 _amount, bytes32[] calldata _merkleProof) external nonReentrant {
+        require(!hasClaimed[msg.sender], "Airdrop already claimed");
+        
+        // Verify the Merkle proof
+        bytes32 leaf = keccak256(abi.encodePacked(msg.sender, _amount));
+        require(MerkleProof.verify(_merkleProof, merkleRoot, leaf), "Invalid Merkle proof");
+        
+        // Mark as claimed
+        hasClaimed[msg.sender] = true;
+        
+        // Transfer tokens to the recipient
+        require(stabulum.transfer(msg.sender, _amount), "Token transfer failed");
+        
+        emit AirdropClaimed(msg.sender, _amount);
+    }
+    
+    /**
+     * @notice Check if an address is eligible for an airdrop and hasn't claimed yet
+     * @param _recipient The address to check
+     * @param _amount The amount of tokens they should receive
+     * @param _merkleProof The Merkle proof to verify
+     * @return Whether the address is eligible and hasn't claimed
+     */
+    function isEligible(address _recipient, uint256 _amount, bytes32[] calldata _merkleProof) external view returns (bool) {
+        if (hasClaimed[_recipient]) {
+            return false;
+        }
+        
+        bytes32 leaf = keccak256(abi.encodePacked(_recipient, _amount));
+        return MerkleProof.verify(_merkleProof, merkleRoot, leaf);
+    }
+    
+    /**
+     * @notice Withdraw any tokens from the contract in case of emergency
+     * @param _amount Amount of tokens to withdraw
+     */
+    function withdrawTokens(uint256 _amount) external onlyOwner {
+        require(stabulum.transfer(owner(), _amount), "Token transfer failed");
+    }
+    
+    /**
+     * @notice Function to get the current balance of tokens in the contract
+     * @return The balance of tokens in the contract
+     */
+    function getContractBalance() external view returns (uint256) {
+        return stabulum.balanceOf(address(this));
+    }
+    
+    /**
+     * @notice Function to clear claimed status for an address (for testing or recovery)
+     * @param _recipient The address to clear the claim status for
+     */
+    function clearClaim(address _recipient) external onlyOwner {
+        hasClaimed[_recipient] = false;
+    }
+    
+    /**
+     * @notice Batch clear claimed status for multiple addresses
+     * @param _recipients Array of addresses to clear the claim status for
+     */
+    function batchClearClaims(address[] calldata _recipients) external onlyOwner {
+        for (uint256 i = 0; i < _recipients.length; i++) {
+            hasClaimed[_recipients[i]] = false;
+        }
+    }
+}

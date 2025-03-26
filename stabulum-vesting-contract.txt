@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+/**
+ * @title Stabulum Vesting Contract
+ * @dev A contract for managing token vesting schedules for team members, investors, and ecosystem partners
+ */
+contract StabulumVesting is Ownable, ReentrancyGuard {
+    // Stabulum token address
+    IERC20 public stabulum;
+    
+    // Vesting schedule information
+    struct VestingSchedule {
+        uint256 totalAmount;      // Total amount of tokens to be vested
+        uint256 releasedAmount;   // Amount of tokens already released
+        uint64 startTime;         // Unix timestamp for starting time of the vesting
+        uint64 cliffDuration;     // Duration in seconds of the cliff
+        uint64 duration;          // Duration in seconds of the vesting period
+        uint32 interval;          // Interval in seconds for token release (e.g., monthly, quarterly)
+        bool revocable;           // Whether this vesting is revocable by the owner
+        bool revoked;             // Whether this vesting has been revoked
+    }
+    
+    // Mapping from beneficiary address to their vesting schedules
+    mapping(address => VestingSchedule[]) public vestingSchedules;
+    
+    // Total amount of tokens in all vesting schedules
+    uint256 public totalVestingAmount;
+    
+    // Events
+    event VestingScheduleCreated(address indexed beneficiary, uint256 index);
+    event TokensReleased(address indexed beneficiary, uint256 amount);
+    event VestingRevoked(address indexed beneficiary, uint256 index);
+    
+    /**
+     * @dev Constructor that initializes the vesting contract with the Stabulum token address
+     * @param _stabulumToken The address of the Stabulum token
+     */
+    constructor(address _stabulumToken) {
+        require(_stabulumToken != address(0), "Stabulum token cannot be zero address");
+        stabulum = IERC20(_stabulumToken);
+    }
+    
+    /**
+     * @notice Creates a new vesting schedule for a beneficiary
+     * @param _beneficiary Address of the beneficiary
+     * @param _totalAmount Total amount of tokens to be vested
+     * @param _startTime Start time of the vesting in unix timestamp
+     * @param _cliffDuration Duration in seconds of the cliff period
+     * @param _duration Duration in seconds of the vesting period
+     * @param _interval Interval in seconds between vesting releases
+     * @param _revocable Whether the vesting is revocable by the owner
+     */
+    function createVestingSchedule(
+        address _beneficiary,
+        uint256 _totalAmount,
+        uint64 _startTime,
+        uint64 _cliffDuration,
+        uint64 _duration,
+        uint32 _interval,
+        bool _revocable
+    ) external onlyOwner {
+        require(_beneficiary != address(0), "Beneficiary cannot be zero address");
+        require(_totalAmount > 0, "Amount must be greater than zero");
+        require(_duration > 0, "Duration must be greater than zero");
+        require(_interval > 0 && _interval <= _duration, "Invalid interval");
+        require(_duration >= _cliffDuration, "Duration must be greater than or equal to cliff");
+        
+        uint256 currentBalance = stabulum.balanceOf(address(this));
+        require(currentBalance >= totalVestingAmount + _totalAmount, "Not enough tokens available for vesting");
+        
+        vestingSchedules[_beneficiary].push(VestingSchedule({
+            totalAmount: _totalAmount,
+            releasedAmount: 0,
+            startTime: _startTime,
+            cliffDuration: _cliffDuration,
+            duration: _duration,
+            interval: _interval,
+            revocable: _revocable,
+            revoked: false
+        }));
+        
+        totalVestingAmount += _totalAmount;
+        
+        emit VestingScheduleCreated(_beneficiary, vestingSchedules[_beneficiary].length - 1);
+    }
+    
+    /**
+     * @notice Calculates the releasable amount of tokens for a specific vesting schedule
+     * @param _beneficiary Address of the beneficiary
+     * @param _index Index of the vesting schedule
+     * @return Amount of releasable tokens
+     */
+    function calculateReleasableAmount(address _beneficiary, uint256 _index) public view returns (uint256) {
+        require(_index < vestingSchedules[_beneficiary].length, "Invalid vesting schedule index");
+        
+        VestingSchedule storage schedule = vestingSchedules[_beneficiary][_index];
+        
+        if (schedule.revoked) {
+            return 0;
+        }
+        
+        if (block.timestamp < schedule.startTime + schedule.cliffDuration) {
+            return 0;
+        }
+        
+        if (block.timestamp >= schedule.startTime + schedule.duration) {
+            return schedule.totalAmount - schedule.releasedAmount;
+        }
+        
+        // Calculate time-based vesting with intervals
+        uint256 timeFromStart = block.timestamp - schedule.startTime;
+        uint256 vestedIntervals = timeFromStart / schedule.interval;
+        uint256 totalIntervals = schedule.duration / schedule.interval;
+        
+        uint256 vestedAmount = (schedule.totalAmount * vestedIntervals) / totalIntervals;
+        return vestedAmount - schedule.releasedAmount;
+    }
+    
+    /**
+     * @notice Releases vested tokens for a specific schedule
+     * @param _beneficiary Address of the beneficiary
+     * @param _index Index of the vesting schedule
+     */
+    function release(address _beneficiary, uint256 _index) external nonReentrant {
+        require(_index < vestingSchedules[_beneficiary].length, "Invalid vesting schedule index");
+        
+        uint256 releasable = calculateReleasableAmount(_beneficiary, _index);
+        require(releasable > 0, "No tokens available for release");
+        
+        VestingSchedule storage schedule = vestingSchedules[_beneficiary][_index];
+        schedule.releasedAmount += releasable;
+        totalVestingAmount -= releasable;
+        
+        require(stabulum.transfer(_beneficiary, releasable), "Token transfer failed");
+        
+        emit TokensReleased(_beneficiary, releasable);
+    }
+    
+    /**
+     * @notice Revokes a vesting schedule
+     * @param _beneficiary Address of the beneficiary
+     * @param _index Index of the vesting schedule
+     */
+    function revoke(address _beneficiary, uint256 _index) external onlyOwner {
+        require(_index < vestingSchedules[_beneficiary].length, "Invalid vesting schedule index");
+        VestingSchedule storage schedule = vestingSchedules[_beneficiary][_index];
+        
+        require(schedule.revocable, "Vesting schedule is not revocable");
+        require(!schedule.revoked, "Vesting schedule already revoked");
+        
+        // Calculate the unreleased amount at the time of revocation
+        uint256 releasable = calculateReleasableAmount(_beneficiary, _index);
+        uint256 unreleased = schedule.totalAmount - schedule.releasedAmount - releasable;
+        
+        // Mark schedule as revoked
+        schedule.revoked = true;
+        
+        // Release any vested but unreleased tokens
+        if (releasable > 0) {
+            schedule.releasedAmount += releasable;
+            require(stabulum.transfer(_beneficiary, releasable), "Token transfer failed");
+            emit TokensReleased(_beneficiary, releasable);
+        }
+        
+        // Reduce the total vesting amount by the unreleased tokens
+        totalVestingAmount -= unreleased;
+        
+        emit VestingRevoked(_beneficiary, _index);
+    }
+    
+    /**
+     * @notice Returns the number of vesting schedules for a beneficiary
+     * @param _beneficiary Address of the beneficiary
+     * @return Number of vesting schedules
+     */
+    function getVestingScheduleCount(address _beneficiary) external view returns (uint256) {
+        return vestingSchedules[_beneficiary].length;
+    }
+    
+    /**
+     * @notice Return a specific vesting schedule details
+     * @param _beneficiary Address of the beneficiary
+     * @param _index Index of the vesting schedule
+     * @return Full vesting schedule information
+     */
+    function getVestingSchedule(address _beneficiary, uint256 _index) external view 
+    returns (
+        uint256 totalAmount,
+        uint256 releasedAmount,
+        uint64 startTime,
+        uint64 cliffDuration,
+        uint64 duration,
+        uint32 interval,
+        bool revocable,
+        bool revoked
+    ) {
+        require(_index < vestingSchedules[_beneficiary].length, "Invalid vesting schedule index");
+        VestingSchedule storage schedule = vestingSchedules[_beneficiary][_index];
+        
+        return (
+            schedule.totalAmount,
+            schedule.releasedAmount,
+            schedule.startTime,
+            schedule.cliffDuration,
+            schedule.duration,
+            schedule.interval,
+            schedule.revocable,
+            schedule.revoked
+        );
+    }
+    
+    /**
+     * @notice Withdraw any excess tokens from the contract
+     * @param _amount Amount of tokens to withdraw
+     */
+    function withdrawExcessTokens(uint256 _amount) external onlyOwner {
+        uint256 currentBalance = stabulum.balanceOf(address(this));
+        require(currentBalance - totalVestingAmount >= _amount, "Cannot withdraw vested tokens");
+        
+        require(stabulum.transfer(owner(), _amount), "Token transfer failed");
+    }
+}

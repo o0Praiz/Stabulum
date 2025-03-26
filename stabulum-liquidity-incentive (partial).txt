@@ -1,0 +1,318 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title StabulumLiquidityIncentive
+ * @dev Contract for providing incentives to liquidity providers
+ * Rewards liquidity providers with governance tokens for providing liquidity to Stabulum pairs
+ */
+contract StabulumLiquidityIncentive is AccessControl, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
+    bytes32 public constant INCENTIVE_ADMIN_ROLE = keccak256("INCENTIVE_ADMIN_ROLE");
+    bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
+
+    // Governance token address
+    IERC20 public governanceToken;
+    
+    // Stabulum token address
+    IERC20 public stabulumToken;
+    
+    // LP token addresses and their weights
+    struct LpPool {
+        address lpTokenAddress;
+        uint256 allocationWeight;
+        uint256 accRewardPerShare;      // Accumulated rewards per share, scaled by 1e12
+        uint256 lastRewardTimestamp;
+        bool isActive;
+    }
+    
+    // Mapping of LP token addresses to their pool info
+    mapping(address => LpPool) public lpPools;
+    address[] public lpPoolList;
+    
+    // Total allocation weight across all LP pools
+    uint256 public totalAllocationWeight;
+    
+    // Reward rate in governance tokens per second
+    uint256 public rewardRate;
+    
+    // End timestamp for rewards
+    uint256 public rewardEndTimestamp;
+    
+    // User staking info
+    struct UserInfo {
+        uint256 amount;              // LP tokens staked
+        uint256 rewardDebt;          // Reward debt
+        uint256 pendingRewards;      // Pending rewards
+        uint256 lastClaimTimestamp;  // Last time rewards were claimed
+    }
+    
+    // Mapping of LP token addresses to user addresses to their info
+    mapping(address => mapping(address => UserInfo)) public userInfo;
+    
+    // Events
+    event PoolAdded(address indexed lpToken, uint256 allocationWeight);
+    event PoolUpdated(address indexed lpToken, uint256 allocationWeight, bool isActive);
+    event Staked(address indexed user, address indexed lpToken, uint256 amount);
+    event Unstaked(address indexed user, address indexed lpToken, uint256 amount);
+    event RewardsClaimed(address indexed user, address indexed lpToken, uint256 reward);
+    event RewardRateUpdated(uint256 oldRate, uint256 newRate);
+    event RewardPeriodExtended(uint256 oldEndTimestamp, uint256 newEndTimestamp);
+    event EmergencyWithdraw(address indexed user, address indexed lpToken, uint256 amount);
+
+    /**
+     * @dev Constructor initializes the contract with required addresses and parameters
+     * @param _governanceToken Address of the governance token
+     * @param _stabulumToken Address of the Stabulum token
+     * @param _rewardRate Initial reward rate in governance tokens per second
+     * @param _rewardDuration Duration of rewards in seconds
+     */
+    constructor(
+        address _governanceToken,
+        address _stabulumToken,
+        uint256 _rewardRate,
+        uint256 _rewardDuration
+    ) {
+        require(_governanceToken != address(0), "Invalid governance token address");
+        require(_stabulumToken != address(0), "Invalid Stabulum token address");
+        require(_rewardRate > 0, "Invalid reward rate");
+        require(_rewardDuration > 0, "Invalid reward duration");
+        
+        governanceToken = IERC20(_governanceToken);
+        stabulumToken = IERC20(_stabulumToken);
+        rewardRate = _rewardRate;
+        rewardEndTimestamp = block.timestamp + _rewardDuration;
+        
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(INCENTIVE_ADMIN_ROLE, msg.sender);
+        _setupRole(GOVERNANCE_ROLE, msg.sender);
+    }
+    
+    /**
+     * @dev Add a new LP pool
+     * @param _lpToken Address of the LP token
+     * @param _allocationWeight Allocation weight for the pool
+     */
+    function addPool(address _lpToken, uint256 _allocationWeight) 
+        external 
+        onlyRole(INCENTIVE_ADMIN_ROLE) 
+    {
+        require(_lpToken != address(0), "Invalid LP token address");
+        require(!lpPools[_lpToken].isActive, "Pool already exists");
+        require(_allocationWeight > 0, "Allocation weight must be positive");
+        
+        // Update all pools before adding a new one
+        massUpdatePools();
+        
+        lpPools[_lpToken] = LpPool({
+            lpTokenAddress: _lpToken,
+            allocationWeight: _allocationWeight,
+            accRewardPerShare: 0,
+            lastRewardTimestamp: block.timestamp,
+            isActive: true
+        });
+        
+        lpPoolList.push(_lpToken);
+        totalAllocationWeight += _allocationWeight;
+        
+        emit PoolAdded(_lpToken, _allocationWeight);
+    }
+    
+    /**
+     * @dev Update a pool's allocation weight
+     * @param _lpToken Address of the LP token
+     * @param _allocationWeight New allocation weight
+     * @param _isActive Whether the pool is active
+     */
+    function updatePool(address _lpToken, uint256 _allocationWeight, bool _isActive) 
+        external 
+        onlyRole(INCENTIVE_ADMIN_ROLE) 
+    {
+        require(lpPools[_lpToken].isActive, "Pool does not exist");
+        
+        // Update all pools before changing weights
+        massUpdatePools();
+        
+        // Update total allocation weight
+        totalAllocationWeight = totalAllocationWeight - lpPools[_lpToken].allocationWeight + _allocationWeight;
+        
+        // Update pool info
+        lpPools[_lpToken].allocationWeight = _allocationWeight;
+        lpPools[_lpToken].isActive = _isActive;
+        
+        emit PoolUpdated(_lpToken, _allocationWeight, _isActive);
+    }
+    
+    /**
+     * @dev Stake LP tokens
+     * @param _lpToken Address of the LP token to stake
+     * @param _amount Amount of LP tokens to stake
+     */
+    function stake(address _lpToken, uint256 _amount) 
+        external 
+        whenNotPaused 
+        nonReentrant 
+    {
+        require(lpPools[_lpToken].isActive, "Pool does not exist or is not active");
+        require(_amount > 0, "Amount must be greater than zero");
+        
+        LpPool storage pool = lpPools[_lpToken];
+        UserInfo storage user = userInfo[_lpToken][msg.sender];
+        
+        // Update pool rewards
+        updatePool(_lpToken);
+        
+        // Transfer LP tokens to this contract
+        IERC20(_lpToken).safeTransferFrom(msg.sender, address(this), _amount);
+        
+        // If user already has staked tokens, calculate pending rewards
+        if (user.amount > 0) {
+            uint256 pending = (user.amount * pool.accRewardPerShare / 1e12) - user.rewardDebt;
+            user.pendingRewards += pending;
+        }
+        
+        // Update user staking info
+        user.amount += _amount;
+        user.rewardDebt = user.amount * pool.accRewardPerShare / 1e12;
+        
+        emit Staked(msg.sender, _lpToken, _amount);
+    }
+    
+    /**
+     * @dev Unstake LP tokens
+     * @param _lpToken Address of the LP token to unstake
+     * @param _amount Amount of LP tokens to unstake
+     */
+    function unstake(address _lpToken, uint256 _amount) 
+        external 
+        nonReentrant 
+    {
+        require(lpPools[_lpToken].isActive, "Pool does not exist");
+        
+        UserInfo storage user = userInfo[_lpToken][msg.sender];
+        require(user.amount >= _amount, "Insufficient staked amount");
+        
+        // Update pool rewards
+        updatePool(_lpToken);
+        
+        // Calculate pending rewards
+        uint256 pending = (user.amount * lpPools[_lpToken].accRewardPerShare / 1e12) - user.rewardDebt;
+        user.pendingRewards += pending;
+        
+        // Update user staking info
+        user.amount -= _amount;
+        user.rewardDebt = user.amount * lpPools[_lpToken].accRewardPerShare / 1e12;
+        
+        // Transfer LP tokens back to user
+        IERC20(_lpToken).safeTransfer(msg.sender, _amount);
+        
+        emit Unstaked(msg.sender, _lpToken, _amount);
+    }
+    
+    /**
+     * @dev Claim rewards
+     * @param _lpToken Address of the LP token to claim rewards for
+     */
+    function claimRewards(address _lpToken) 
+        external 
+        nonReentrant 
+    {
+        require(lpPools[_lpToken].isActive, "Pool does not exist");
+        
+        // Update pool rewards
+        updatePool(_lpToken);
+        
+        UserInfo storage user = userInfo[_lpToken][msg.sender];
+        
+        // Calculate pending rewards
+        uint256 pending = (user.amount * lpPools[_lpToken].accRewardPerShare / 1e12) - user.rewardDebt;
+        uint256 totalRewards = user.pendingRewards + pending;
+        
+        // Reset pending rewards
+        user.pendingRewards = 0;
+        user.rewardDebt = user.amount * lpPools[_lpToken].accRewardPerShare / 1e12;
+        user.lastClaimTimestamp = block.timestamp;
+        
+        // Transfer rewards to user
+        if (totalRewards > 0) {
+            governanceToken.safeTransfer(msg.sender, totalRewards);
+        }
+        
+        emit RewardsClaimed(msg.sender, _lpToken, totalRewards);
+    }
+    
+    /**
+     * @dev Emergency withdraw LP tokens without caring about rewards
+     * @param _lpToken Address of the LP token to withdraw
+     */
+    function emergencyWithdraw(address _lpToken) 
+        external 
+        nonReentrant 
+    {
+        UserInfo storage user = userInfo[_lpToken][msg.sender];
+        uint256 amount = user.amount;
+        
+        // Reset user info
+        user.amount = 0;
+        user.rewardDebt = 0;
+        user.pendingRewards = 0;
+        
+        // Transfer LP tokens back to user
+        IERC20(_lpToken).safeTransfer(msg.sender, amount);
+        
+        emit EmergencyWithdraw(msg.sender, _lpToken, amount);
+    }
+    
+    /**
+     * @dev Update all pools
+     */
+    function massUpdatePools() public {
+        for (uint256 i = 0; i < lpPoolList.length; i++) {
+            updatePool(lpPoolList[i]);
+        }
+    }
+    
+    /**
+     * @dev Update pool rewards
+     * @param _lpToken Address of the LP token to update
+     */
+    function updatePool(address _lpToken) public {
+        LpPool storage pool = lpPools[_lpToken];
+        
+        if (block.timestamp <= pool.lastRewardTimestamp) {
+            return;
+        }
+        
+        // If pool is inactive or there are no staked tokens, just update timestamp
+        if (!pool.isActive || IERC20(_lpToken).balanceOf(address(this)) == 0) {
+            pool.lastRewardTimestamp = block.timestamp;
+            return;
+        }
+        
+        // Calculate reward for the time period
+        uint256 endTimestamp = block.timestamp > rewardEndTimestamp ? rewardEndTimestamp : block.timestamp;
+        if (endTimestamp <= pool.lastRewardTimestamp) {
+            return;
+        }
+        
+        uint256 timeElapsed = endTimestamp - pool.lastRewardTimestamp;
+        uint256 reward = timeElapsed * rewardRate * pool.allocationWeight / totalAllocationWeight;
+        
+        // Update accumulated reward per share
+        uint256 lpSupply = IERC20(_lpToken).balanceOf(address(this));
+        if (lpSupply > 0) {
+            pool.accRewardPerShare += reward * 1e12 / lpSupply;
+        }
+        
+        pool.lastRewardTimestamp = endTimestamp;
+    }
+    
+    /**
+     * @

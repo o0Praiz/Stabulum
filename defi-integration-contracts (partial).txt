@@ -1,0 +1,736 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title StabulumLendingPool
+ * @dev Contract for lending and borrowing Stabulum tokens
+ */
+contract StabulumLendingPool is AccessControl, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
+    // Roles
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant RISK_MANAGER_ROLE = keccak256("RISK_MANAGER_ROLE");
+    
+    // Stabulum token
+    IERC20 public stabulumToken;
+    
+    // Pool parameters
+    uint256 public depositAPY; // Annual percentage yield for deposits (in basis points)
+    uint256 public borrowAPY; // Annual percentage yield for borrowing (in basis points)
+    uint256 public collateralRatio; // Required collateral ratio (in basis points, e.g., 15000 = 150%)
+    uint256 public liquidationThreshold; // Threshold for liquidation (in basis points, e.g., 12500 = 125%)
+    uint256 public liquidationPenalty; // Penalty for liquidation (in basis points, e.g., 500 = 5%)
+    uint256 public reserveFactor; // Percentage of interest that goes to reserves (in basis points)
+    uint256 public constant BASIS_POINTS = 10000; // 100%
+    
+    // User balances and data
+    struct UserAccount {
+        uint256 deposited; // Amount of Stabulum deposited
+        uint256 borrowed; // Amount of Stabulum borrowed
+        uint256 lastUpdateTimestamp; // Last time the account was updated
+        address[] collateralTokens; // List of tokens used as collateral
+        mapping(address => uint256) collateralAmounts; // Amount of each collateral token
+    }
+    
+    mapping(address => UserAccount) public userAccounts;
+    mapping(address => bool) public supportedCollaterals; // Tokens that can be used as collateral
+    mapping(address => uint256) public collateralFactors; // Value factor for each collateral (in basis points)
+    
+    // Pool state
+    uint256 public totalDeposits;
+    uint256 public totalBorrows;
+    uint256 public totalReserves;
+    
+    // Price oracle interface
+    IPriceOracle public priceOracle;
+    
+    // Events
+    event Deposit(address indexed user, uint256 amount);
+    event Withdraw(address indexed user, uint256 amount);
+    event Borrow(address indexed user, uint256 amount);
+    event Repay(address indexed user, uint256 amount);
+    event CollateralDeposited(address indexed user, address indexed token, uint256 amount);
+    event CollateralWithdrawn(address indexed user, address indexed token, uint256 amount);
+    event Liquidation(address indexed liquidator, address indexed borrower, uint256 repaidAmount, address indexed collateralToken, uint256 liquidatedCollateral);
+    
+    /**
+     * @dev Initialize the lending pool
+     * @param _stabulumToken Address of the Stabulum token
+     * @param _priceOracle Address of the price oracle
+     */
+    constructor(address _stabulumToken, address _priceOracle) {
+        require(_stabulumToken != address(0), "Invalid Stabulum token address");
+        require(_priceOracle != address(0), "Invalid price oracle address");
+        
+        stabulumToken = IERC20(_stabulumToken);
+        priceOracle = IPriceOracle(_priceOracle);
+        
+        // Default parameters
+        depositAPY = 500; // 5%
+        borrowAPY = 800; // 8%
+        collateralRatio = 15000; // 150%
+        liquidationThreshold = 12500; // 125%
+        liquidationPenalty = 500; // 5%
+        reserveFactor = 1000; // 10%
+        
+        // Set up roles
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(ADMIN_ROLE, msg.sender);
+        _setupRole(RISK_MANAGER_ROLE, msg.sender);
+    }
+    
+    /**
+     * @dev Deposit Stabulum tokens into the lending pool
+     * @param _amount Amount of Stabulum to deposit
+     */
+    function deposit(uint256 _amount) external nonReentrant whenNotPaused {
+        require(_amount > 0, "Amount must be greater than zero");
+        
+        // Update user's interest before changing balance
+        _updateUserInterest(msg.sender);
+        
+        // Transfer tokens from user to contract
+        stabulumToken.safeTransferFrom(msg.sender, address(this), _amount);
+        
+        // Update user's deposit
+        userAccounts[msg.sender].deposited += _amount;
+        totalDeposits += _amount;
+        
+        emit Deposit(msg.sender, _amount);
+    }
+    
+    /**
+     * @dev Withdraw Stabulum tokens from the lending pool
+     * @param _amount Amount of Stabulum to withdraw
+     */
+    function withdraw(uint256 _amount) external nonReentrant {
+        require(_amount > 0, "Amount must be greater than zero");
+        
+        // Update user's interest before changing balance
+        _updateUserInterest(msg.sender);
+        
+        UserAccount storage account = userAccounts[msg.sender];
+        require(account.deposited >= _amount, "Insufficient deposit balance");
+        
+        // Check if withdrawal would affect collateral requirements
+        uint256 remainingDeposits = account.deposited - _amount;
+        require(remainingDeposits >= account.borrowed, "Cannot withdraw collateralized deposits");
+        
+        // Update user's deposit
+        account.deposited = remainingDeposits;
+        totalDeposits -= _amount;
+        
+        // Transfer tokens to user
+        stabulumToken.safeTransfer(msg.sender, _amount);
+        
+        emit Withdraw(msg.sender, _amount);
+    }
+    
+    /**
+     * @dev Borrow Stabulum tokens from the lending pool
+     * @param _amount Amount of Stabulum to borrow
+     */
+    function borrow(uint256 _amount) external nonReentrant whenNotPaused {
+        require(_amount > 0, "Amount must be greater than zero");
+        require(totalDeposits - totalBorrows >= _amount, "Insufficient liquidity in pool");
+        
+        // Update user's interest before changing balance
+        _updateUserInterest(msg.sender);
+        
+        UserAccount storage account = userAccounts[msg.sender];
+        
+        // Calculate total collateral value including deposits
+        uint256 totalCollateralValue = account.deposited;
+        for (uint i = 0; i < account.collateralTokens.length; i++) {
+            address token = account.collateralTokens[i];
+            uint256 amount = account.collateralAmounts[token];
+            if (amount > 0) {
+                uint256 tokenValue = _getCollateralValue(token, amount);
+                totalCollateralValue += tokenValue;
+            }
+        }
+        
+        // Check if new borrow would meet collateral requirements
+        uint256 newTotalBorrow = account.borrowed + _amount;
+        uint256 requiredCollateral = (newTotalBorrow * collateralRatio) / BASIS_POINTS;
+        require(totalCollateralValue >= requiredCollateral, "Insufficient collateral");
+        
+        // Update user's borrow
+        account.borrowed = newTotalBorrow;
+        totalBorrows += _amount;
+        
+        // Transfer tokens to user
+        stabulumToken.safeTransfer(msg.sender, _amount);
+        
+        emit Borrow(msg.sender, _amount);
+    }
+    
+    /**
+     * @dev Repay borrowed Stabulum tokens
+     * @param _amount Amount of Stabulum to repay
+     */
+    function repay(uint256 _amount) external nonReentrant {
+        require(_amount > 0, "Amount must be greater than zero");
+        
+        // Update user's interest before changing balance
+        _updateUserInterest(msg.sender);
+        
+        UserAccount storage account = userAccounts[msg.sender];
+        require(account.borrowed > 0, "No outstanding debt");
+        
+        uint256 repayAmount = _amount;
+        if (repayAmount > account.borrowed) {
+            repayAmount = account.borrowed;
+        }
+        
+        // Transfer tokens from user to contract
+        stabulumToken.safeTransferFrom(msg.sender, address(this), repayAmount);
+        
+        // Update user's borrow
+        account.borrowed -= repayAmount;
+        totalBorrows -= repayAmount;
+        
+        emit Repay(msg.sender, repayAmount);
+    }
+    
+    /**
+     * @dev Deposit collateral token
+     * @param _token Collateral token address
+     * @param _amount Amount of collateral token to deposit
+     */
+    function depositCollateral(address _token, uint256 _amount) external nonReentrant whenNotPaused {
+        require(supportedCollaterals[_token], "Token not supported as collateral");
+        require(_amount > 0, "Amount must be greater than zero");
+        
+        UserAccount storage account = userAccounts[msg.sender];
+        
+        // If first time adding this collateral token, add to array
+        if (account.collateralAmounts[_token] == 0) {
+            account.collateralTokens.push(_token);
+        }
+        
+        // Transfer tokens from user to contract
+        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
+        
+        // Update user's collateral
+        account.collateralAmounts[_token] += _amount;
+        
+        emit CollateralDeposited(msg.sender, _token, _amount);
+    }
+    
+    /**
+     * @dev Withdraw collateral token
+     * @param _token Collateral token address
+     * @param _amount Amount of collateral token to withdraw
+     */
+    function withdrawCollateral(address _token, uint256 _amount) external nonReentrant {
+        require(_amount > 0, "Amount must be greater than zero");
+        
+        // Update user's interest before checking collateral
+        _updateUserInterest(msg.sender);
+        
+        UserAccount storage account = userAccounts[msg.sender];
+        require(account.collateralAmounts[_token] >= _amount, "Insufficient collateral balance");
+        
+        // Calculate remaining collateral value
+        uint256 tokenValue = _getCollateralValue(_token, _amount);
+        uint256 totalCollateralValue = account.deposited;
+        
+        for (uint i = 0; i < account.collateralTokens.length; i++) {
+            address token = account.collateralTokens[i];
+            uint256 amount = account.collateralAmounts[token];
+            if (amount > 0) {
+                if (token == _token) {
+                    // Only count remaining collateral
+                    totalCollateralValue += _getCollateralValue(token, amount - _amount);
+                } else {
+                    totalCollateralValue += _getCollateralValue(token, amount);
+                }
+            }
+        }
+        
+        // Check if withdrawal would maintain collateral requirements
+        uint256 requiredCollateral = (account.borrowed * collateralRatio) / BASIS_POINTS;
+        require(totalCollateralValue >= requiredCollateral, "Withdrawal would violate collateral requirements");
+        
+        // Update user's collateral
+        account.collateralAmounts[_token] -= _amount;
+        
+        // Remove token from array if balance is zero
+        if (account.collateralAmounts[_token] == 0) {
+            for (uint i = 0; i < account.collateralTokens.length; i++) {
+                if (account.collateralTokens[i] == _token) {
+                    // Replace with last element and pop
+                    account.collateralTokens[i] = account.collateralTokens[account.collateralTokens.length - 1];
+                    account.collateralTokens.pop();
+                    break;
+                }
+            }
+        }
+        
+        // Transfer tokens to user
+        IERC20(_token).safeTransfer(msg.sender, _amount);
+        
+        emit CollateralWithdrawn(msg.sender, _token, _amount);
+    }
+    
+    /**
+     * @dev Liquidate an undercollateralized position
+     * @param _borrower Address of the borrower to liquidate
+     * @param _repayAmount Amount of Stabulum debt to repay
+     * @param _collateralToken Token to receive as liquidation collateral
+     */
+    function liquidate(address _borrower, uint256 _repayAmount, address _collateralToken) external nonReentrant whenNotPaused {
+        require(_borrower != msg.sender, "Cannot liquidate own position");
+        require(_repayAmount > 0, "Amount must be greater than zero");
+        
+        // Update borrower's interest before checking health
+        _updateUserInterest(_borrower);
+        
+        UserAccount storage account = userAccounts[_borrower];
+        require(account.borrowed > 0, "No outstanding debt");
+        require(account.collateralAmounts[_collateralToken] > 0, "No collateral of requested type");
+        
+        // Check if position is undercollateralized
+        bool isUndercollateralized = _isUndercollateralized(_borrower);
+        require(isUndercollateralized, "Position is not undercollateralized");
+        
+        // Limit repay amount to the borrower's debt
+        uint256 actualRepayAmount = _repayAmount;
+        if (actualRepayAmount > account.borrowed) {
+            actualRepayAmount = account.borrowed;
+        }
+        
+        // Calculate collateral to seize (including liquidation bonus)
+        uint256 stabulumPrice = priceOracle.getPrice(address(stabulumToken));
+        uint256 collateralPrice = priceOracle.getPrice(_collateralToken);
+        
+        uint256 collateralToSeize = (actualRepayAmount * stabulumPrice * (BASIS_POINTS + liquidationPenalty)) / 
+                                    (collateralPrice * BASIS_POINTS);
+        
+        // Make sure we don't seize more than what's available
+        if (collateralToSeize > account.collateralAmounts[_collateralToken]) {
+            collateralToSeize = account.collateralAmounts[_collateralToken];
+        }
+        
+        // Transfer repayment from liquidator
+        stabulumToken.safeTransferFrom(msg.sender, address(this), actualRepayAmount);
+        
+        // Update borrower's position
+        account.borrowed -= actualRepayAmount;
+        account.collateralAmounts[_collateralToken] -= collateralToSeize;
+        totalBorrows -= actualRepayAmount;
+        
+        // Transfer seized collateral to liquidator
+        IERC20(_collateralToken).safeTransfer(msg.sender, collateralToSeize);
+        
+        // Remove collateral token if balance is zero
+        if (account.collateralAmounts[_collateralToken] == 0) {
+            for (uint i = 0; i < account.collateralTokens.length; i++) {
+                if (account.collateralTokens[i] == _collateralToken) {
+                    account.collateralTokens[i] = account.collateralTokens[account.collateralTokens.length - 1];
+                    account.collateralTokens.pop();
+                    break;
+                }
+            }
+        }
+        
+        emit Liquidation(msg.sender, _borrower, actualRepayAmount, _collateralToken, collateralToSeize);
+    }
+    
+    /**
+     * @dev Add a supported collateral token
+     * @param _token Address of collateral token
+     * @param _factor Collateral factor (in basis points)
+     */
+    function addCollateralToken(address _token, uint256 _factor) external onlyRole(RISK_MANAGER_ROLE) {
+        require(_token != address(0), "Invalid token address");
+        require(_factor > 0 && _factor <= BASIS_POINTS, "Invalid collateral factor");
+        
+        supportedCollaterals[_token] = true;
+        collateralFactors[_token] = _factor;
+    }
+    
+    /**
+     * @dev Update pool parameters
+     * @param _depositAPY New deposit APY (in basis points)
+     * @param _borrowAPY New borrow APY (in basis points)
+     * @param _collateralRatio New collateral ratio (in basis points)
+     * @param _liquidationThreshold New liquidation threshold (in basis points)
+     * @param _liquidationPenalty New liquidation penalty (in basis points)
+     * @param _reserveFactor New reserve factor (in basis points)
+     */
+    function updatePoolParameters(
+        uint256 _depositAPY,
+        uint256 _borrowAPY,
+        uint256 _collateralRatio,
+        uint256 _liquidationThreshold,
+        uint256 _liquidationPenalty,
+        uint256 _reserveFactor
+    ) external onlyRole(ADMIN_ROLE) {
+        require(_depositAPY <= 5000, "Deposit APY too high"); // Max 50%
+        require(_borrowAPY <= 10000, "Borrow APY too high"); // Max 100%
+        require(_collateralRatio >= 10000, "Collateral ratio too low"); // Min 100%
+        require(_liquidationThreshold < _collateralRatio, "Liquidation threshold must be lower than collateral ratio");
+        require(_liquidationPenalty <= 3000, "Liquidation penalty too high"); // Max 30%
+        require(_reserveFactor <= 5000, "Reserve factor too high"); // Max 50%
+        
+        depositAPY = _depositAPY;
+        borrowAPY = _borrowAPY;
+        collateralRatio = _collateralRatio;
+        liquidationThreshold = _liquidationThreshold;
+        liquidationPenalty = _liquidationPenalty;
+        reserveFactor = _reserveFactor;
+    }
+    
+    /**
+     * @dev Pause the contract
+     */
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpause the contract
+     */
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
+    
+    /**
+     * @dev Update user's interest accruals
+     * @param _user Address of the user
+     */
+    function _updateUserInterest(address _user) internal {
+        UserAccount storage account = userAccounts[_user];
+        uint256 timeElapsed = block.timestamp - account.lastUpdateTimestamp;
+        
+        if (timeElapsed > 0 && account.lastUpdateTimestamp > 0) {
+            // Calculate deposit interest
+            if (account.deposited > 0) {
+                uint256 depositInterest = (account.deposited * depositAPY * timeElapsed) / (BASIS_POINTS * 365 days);
+                account.deposited += depositInterest;
+                totalDeposits += depositInterest;
+            }
+            
+            // Calculate borrow interest
+            if (account.borrowed > 0) {
+                uint256 borrowInterest = (account.borrowed * borrowAPY * timeElapsed) / (BASIS_POINTS * 365 days);
+                
+                // Part of interest goes to reserves
+                uint256 reserveInterest = (borrowInterest * reserveFactor) / BASIS_POINTS;
+                totalReserves += reserveInterest;
+                
+                account.borrowed += borrowInterest;
+                totalBorrows += borrowInterest;
+            }
+        }
+        
+        account.lastUpdateTimestamp = block.timestamp;
+    }
+    
+    /**
+     * @dev Check if a user's position is undercollateralized
+     * @param _user Address of the user
+     * @return True if position is undercollateralized
+     */
+    function _isUndercollateralized(address _user) internal view returns (bool) {
+        UserAccount storage account = userAccounts[_user];
+        
+        if (account.borrowed == 0) {
+            return false;
+        }
+        
+        // Calculate total collateral value
+        uint256 totalCollateralValue = account.deposited;
+        for (uint i = 0; i < account.collateralTokens.length; i++) {
+            address token = account.collateralTokens[i];
+            uint256 amount = account.collateralAmounts[token];
+            if (amount > 0) {
+                totalCollateralValue += _getCollateralValue(token, amount);
+            }
+        }
+        
+        // Check if below liquidation threshold
+        uint256 requiredCollateral = (account.borrowed * liquidationThreshold) / BASIS_POINTS;
+        return totalCollateralValue < requiredCollateral;
+    }
+    
+    /**
+     * @dev Get the value of collateral in Stabulum terms
+     * @param _token Collateral token address
+     * @param _amount Amount of collateral token
+     * @return Value of collateral in Stabulum terms
+     */
+    function _getCollateralValue(address _token, uint256 _amount) internal view returns (uint256) {
+        uint256 tokenPrice = priceOracle.getPrice(_token);
+        uint256 stabulumPrice = priceOracle.getPrice(address(stabulumToken));
+        uint256 factor = collateralFactors[_token];
+        
+        return (_amount * tokenPrice * factor) / (stabulumPrice * BASIS_POINTS);
+    }
+}
+
+/**
+ * @title IPriceOracle
+ * @dev Interface for price oracle
+ */
+interface IPriceOracle {
+    function getPrice(address token) external view returns (uint256);
+}
+
+/**
+ * @title StabulumStaking
+ * @dev Contract for staking Stabulum tokens
+ */
+contract StabulumStaking is AccessControl, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
+    // Roles
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant REWARDS_DISTRIBUTOR_ROLE = keccak256("REWARDS_DISTRIBUTOR_ROLE");
+    
+    // Stabulum token
+    IERC20 public stabulumToken;
+    
+    // Reward token (can be the same as Stabulum)
+    IERC20 public rewardToken;
+    
+    // Staking parameters
+    uint256 public rewardRate; // Rewards per second
+    uint256 public lastUpdateTime; // Last time rewards were updated
+    uint256 public rewardPerTokenStored; // Accumulated rewards per token
+    
+    // User data
+    mapping(address => uint256) public userRewardPerTokenPaid;
+    mapping(address => uint256) public rewards;
+    mapping(address => uint256) public balances;
+    
+    // Total staked
+    uint256 public totalStaked;
+    
+    // Lock periods
+    struct LockPeriod {
+        uint256 duration; // Duration in seconds
+        uint256 rewardMultiplier; // Multiplier in basis points (e.g., 12000 = 120%)
+    }
+    
+    mapping(uint256 => LockPeriod) public lockPeriods;
+    uint256 public lockPeriodsCount;
+    
+    // User lock data
+    struct UserLock {
+        uint256 lockPeriodId;
+        uint256 amount;
+        uint256 unlockTime;
+    }
+    
+    mapping(address => UserLock[]) public userLocks;
+    
+    // Events
+    event Staked(address indexed user, uint256 amount, uint256 lockPeriodId);
+    event Withdrawn(address indexed user, uint256 amount);
+    event RewardPaid(address indexed user, uint256 reward);
+    event RewardAdded(uint256 reward);
+    event LockPeriodAdded(uint256 id, uint256 duration, uint256 rewardMultiplier);
+    
+    /**
+     * @dev Initialize the staking contract
+     * @param _stabulumToken Address of the Stabulum token
+     * @param _rewardToken Address of the reward token
+     */
+    constructor(address _stabulumToken, address _rewardToken) {
+        require(_stabulumToken != address(0), "Invalid Stabulum token address");
+        require(_rewardToken != address(0), "Invalid reward token address");
+        
+        stabulumToken = IERC20(_stabulumToken);
+        rewardToken = IERC20(_rewardToken);
+        
+        // Set up roles
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(ADMIN_ROLE, msg.sender);
+        _setupRole(REWARDS_DISTRIBUTOR_ROLE, msg.sender);
+        
+        // Default lock period (no lock)
+        lockPeriods[0] = LockPeriod({
+            duration: 0,
+            rewardMultiplier: 10000 // 100%
+        });
+        lockPeriodsCount = 1;
+    }
+    
+    /**
+     * @dev Update rewards for an account
+     * @param _account Address of the account
+     */
+    modifier updateReward(address _account) {
+        rewardPerTokenStored = rewardPerToken();
+        lastUpdateTime = lastTimeRewardApplicable();
+        
+        if (_account != address(0)) {
+            rewards[_account] = earned(_account);
+            userRewardPerTokenPaid[_account] = rewardPerTokenStored;
+        }
+        _;
+    }
+    
+    /**
+     * @dev Get the last time rewards were applicable
+     * @return Last applicable time
+     */
+    function lastTimeRewardApplicable() public view returns (uint256) {
+        return block.timestamp;
+    }
+    
+    /**
+     * @dev Calculate reward per token
+     * @return Reward per token
+     */
+    function rewardPerToken() public view returns (uint256) {
+        if (totalStaked == 0) {
+            return rewardPerTokenStored;
+        }
+        
+        return
+            rewardPerTokenStored +
+            (((lastTimeRewardApplicable() - lastUpdateTime) * rewardRate * 1e18) / totalStaked);
+    }
+    
+    /**
+     * @dev Calculate earned rewards for an account
+     * @param _account Address of the account
+     * @return Earned rewards
+     */
+    function earned(address _account) public view returns (uint256) {
+        uint256 baseEarnings = ((balances[_account] * 
+                              (rewardPerToken() - userRewardPerTokenPaid[_account])) / 1e18) +
+                              rewards[_account];
+        
+        // Apply reward multipliers for locked stakes
+        uint256 additionalEarnings = 0;
+        UserLock[] storage locks = userLocks[_account];
+        for (uint i = 0; i < locks.length; i++) {
+            if (locks[i].unlockTime > block.timestamp) {
+                uint256 multiplier = lockPeriods[locks[i].lockPeriodId].rewardMultiplier;
+                uint256 lockBonus = (baseEarnings * locks[i].amount * (multiplier - 10000)) / 
+                                   (balances[_account] * 10000);
+                additionalEarnings += lockBonus;
+            }
+        }
+        
+        return baseEarnings + additionalEarnings;
+    }
+    
+    /**
+     * @dev Stake tokens
+     * @param _amount Amount to stake
+     * @param _lockPeriodId ID of lock period to use
+     */
+    function stake(uint256 _amount, uint256 _lockPeriodId) external nonReentrant whenNotPaused updateReward(msg.sender) {
+        require(_amount > 0, "Cannot stake 0");
+        require(_lockPeriodId < lockPeriodsCount, "Invalid lock period ID");
+        
+        totalStaked += _amount;
+        balances[msg.sender] += _amount;
+        
+        // If lock period is not 0, create a lock
+        if (_lockPeriodId > 0) {
+            LockPeriod memory lockPeriod = lockPeriods[_lockPeriodId];
+            userLocks[msg.sender].push(UserLock({
+                lockPeriodId: _lockPeriodId,
+                amount: _amount,
+                unlockTime: block.timestamp + lockPeriod.duration
+            }));
+        }
+        
+        stabulumToken.safeTransferFrom(msg.sender, address(this), _amount);
+        emit Staked(msg.sender, _amount, _lockPeriodId);
+    }
+    
+    /**
+     * @dev Withdraw staked tokens
+     * @param _amount Amount to withdraw
+     */
+    function withdraw(uint256 _amount) external nonReentrant updateReward(msg.sender) {
+        require(_amount > 0, "Cannot withdraw 0");
+        require(balances[msg.sender] >= _amount, "Not enough staked");
+        
+        // Check if withdrawal would affect locks
+        _checkLocks(msg.sender, _amount);
+        
+        totalStaked -= _amount;
+        balances[msg.sender] -= _amount;
+        
+        stabulumToken.safeTransfer(msg.sender, _amount);
+        emit Withdrawn(msg.sender, _amount);
+    }
+    
+    /**
+     * @dev Claim rewards
+     */
+    function getReward() external nonReentrant updateReward(msg.sender) {
+        uint256 reward = rewards[msg.sender];
+        if (reward > 0) {
+            rewards[msg.sender] = 0;
+            rewardToken.safeTransfer(msg.sender, reward);
+            emit RewardPaid(msg.sender, reward);
+        }
+    }
+    
+    /**
+     * @dev Exit - withdraw all staked tokens and claim rewards
+     */
+    function exit() external {
+        withdraw(balances[msg.sender]);
+        getReward();
+    }
+    
+    /**
+     * @dev Add rewards to the contract
+     * @param _amount Amount of rewards to add
+     */
+    function notifyRewardAmount(uint256 _amount) external onlyRole(REWARDS_DISTRIBUTOR_ROLE) updateReward(address(0)) {
+        rewardToken.safeTransferFrom(msg.sender, address(this), _amount);
+        
+        if (block.timestamp >= lastUpdateTime) {
+            // Calculate new reward rate (rewards per second)
+            rewardRate = _amount / (30 days); // Distribute over 30 days
+        }
+        
+        // Update last update time
+        lastUpdateTime = block.timestamp;
+        emit RewardAdded(_amount);
+    }
+    
+    /**
+     * @dev Add a new lock period
+     * @param _duration Duration in seconds
+     * @param _rewardMultiplier Reward multiplier in basis points
+     */
+    function addLockPeriod(uint256 _duration, uint256 _rewardMultiplier) external onlyRole(ADMIN_ROLE) {
+        require(_duration > 0, "Duration must be greater than 0");
+        require(_rewardMultiplier >= 10000, "Multiplier must be at least 100%");
+        
+        uint256 id = lockPeriodsCount;
+        lockPeriods[id] = LockPeriod({
+            duration: _duration,
+            rewardMultiplier: _rewardMultiplier
+        });
+        lockPeriodsCount++;
+        
+        emit LockPeriodAdded(id, _duration, _rewardMultiplier);
+    }
+    
+    /**
+     * @dev Check if withdrawal would affect locks
+     * @param _user Address of the user
+     * @param _amount Amount to withdraw
+     */
+    function _checkLocks(address _user, uint256 

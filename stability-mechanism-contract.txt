@@ -1,0 +1,258 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @title StabulumStabilityMechanism
+ * @dev Contract that manages the stability of the Stabulum stablecoin through various mechanisms
+ * including rebasing, fee adjustments, and market operations.
+ */
+contract StabulumStabilityMechanism is AccessControl, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // Roles
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+    
+    // Stabulum token interface
+    IERC20 public stabulumToken;
+    
+    // Reserve token (e.g., USDC)
+    IERC20 public reserveToken;
+    
+    // Stability parameters
+    uint256 public targetPrice; // Target price in reserve token (e.g., 1 USDC)
+    uint256 public priceTolerance; // Acceptable deviation from target (e.g., 0.5%)
+    uint256 public stabilityFee; // Fee charged on certain operations (basis points, e.g., 25 = 0.25%)
+    uint256 public constant BASIS_POINTS = 10000; // 100%
+    
+    // Price tracking
+    uint256 public currentPrice;
+    uint256 public lastPriceUpdateTimestamp;
+    uint256 public priceUpdateInterval; // How often the price should be updated
+    
+    // Market operation parameters
+    uint256 public maxMarketOperation; // Maximum amount for a single market operation
+    
+    // Rebase parameters
+    bool public rebasingEnabled;
+    uint256 public rebaseThreshold; // Threshold deviation that triggers a rebase (basis points)
+    uint256 public lastRebaseTimestamp;
+    uint256 public rebaseInterval; // Minimum time between rebases
+    
+    // Events
+    event PriceUpdated(uint256 previousPrice, uint256 newPrice);
+    event StabilityFeeUpdated(uint256 previousFee, uint256 newFee);
+    event MarketOperation(bool isBuy, uint256 stabulumAmount, uint256 reserveAmount);
+    event Rebase(int256 rebaseFactor, uint256 totalSupplyBefore, uint256 totalSupplyAfter);
+    
+    /**
+     * @dev Initialize the stability mechanism with required parameters
+     * @param _stabulumToken Address of the Stabulum token
+     * @param _reserveToken Address of the reserve token (e.g., USDC)
+     * @param _targetPrice Initial target price (e.g., 1e18 for 1 USDC if both tokens have 18 decimals)
+     */
+    constructor(
+        address _stabulumToken,
+        address _reserveToken,
+        uint256 _targetPrice
+    ) {
+        require(_stabulumToken != address(0), "Invalid Stabulum token address");
+        require(_reserveToken != address(0), "Invalid reserve token address");
+        
+        stabulumToken = IERC20(_stabulumToken);
+        reserveToken = IERC20(_reserveToken);
+        targetPrice = _targetPrice;
+        
+        // Default parameters
+        priceTolerance = 50; // 0.5%
+        stabilityFee = 25; // 0.25%
+        priceUpdateInterval = 3600; // 1 hour
+        maxMarketOperation = 100000 * 10**18; // 100,000 tokens
+        rebasingEnabled = false;
+        rebaseThreshold = 300; // 3%
+        rebaseInterval = 86400; // 24 hours
+        
+        // Set up roles
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(OPERATOR_ROLE, msg.sender);
+        _setupRole(ORACLE_ROLE, msg.sender);
+        
+        // Initialize price
+        currentPrice = _targetPrice;
+        lastPriceUpdateTimestamp = block.timestamp;
+        lastRebaseTimestamp = block.timestamp;
+    }
+    
+    /**
+     * @dev Update the current price, can only be called by oracle
+     * @param _newPrice The new price of Stabulum in terms of the reserve token
+     */
+    function updatePrice(uint256 _newPrice) external onlyRole(ORACLE_ROLE) {
+        require(block.timestamp >= lastPriceUpdateTimestamp + priceUpdateInterval, "Too soon for price update");
+        
+        emit PriceUpdated(currentPrice, _newPrice);
+        currentPrice = _newPrice;
+        lastPriceUpdateTimestamp = block.timestamp;
+        
+        // Check if rebase is needed
+        checkAndRebase();
+    }
+    
+    /**
+     * @dev Check if rebase is needed and perform it if necessary
+     */
+    function checkAndRebase() public {
+        if (!rebasingEnabled) return;
+        if (block.timestamp < lastRebaseTimestamp + rebaseInterval) return;
+        
+        uint256 priceDeviation;
+        if (currentPrice > targetPrice) {
+            priceDeviation = ((currentPrice - targetPrice) * BASIS_POINTS) / targetPrice;
+        } else {
+            priceDeviation = ((targetPrice - currentPrice) * BASIS_POINTS) / targetPrice;
+        }
+        
+        // If deviation exceeds threshold, perform rebase
+        if (priceDeviation > rebaseThreshold) {
+            performRebase();
+        }
+    }
+    
+    /**
+     * @dev Perform a rebase operation to adjust supply based on price
+     */
+    function performRebase() internal {
+        require(rebasingEnabled, "Rebasing is not enabled");
+        require(block.timestamp >= lastRebaseTimestamp + rebaseInterval, "Too soon for rebase");
+        
+        // Calculate how much to rebase
+        int256 rebaseFactor;
+        if (currentPrice > targetPrice) {
+            // If price is too high, increase supply
+            uint256 increasePercentage = ((currentPrice - targetPrice) * BASIS_POINTS) / targetPrice;
+            rebaseFactor = int256(increasePercentage);
+        } else {
+            // If price is too low, decrease supply
+            uint256 decreasePercentage = ((targetPrice - currentPrice) * BASIS_POINTS) / targetPrice;
+            rebaseFactor = -int256(decreasePercentage);
+        }
+        
+        // Get current supply (this assumes the token has a method to get total supply)
+        uint256 totalSupplyBefore = stabulumToken.totalSupply();
+        
+        // Call rebase function on the token (this assumes the token has a rebase function)
+        // This is a simplified example - actual implementation would depend on the token contract
+        IRebasableToken rebasableToken = IRebasableToken(address(stabulumToken));
+        rebasableToken.rebase(rebaseFactor);
+        
+        uint256 totalSupplyAfter = stabulumToken.totalSupply();
+        
+        emit Rebase(rebaseFactor, totalSupplyBefore, totalSupplyAfter);
+        lastRebaseTimestamp = block.timestamp;
+    }
+    
+    /**
+     * @dev Perform market operations to stabilize the price
+     * @param isBuy True if buying Stabulum from the market, false if selling
+     * @param amount Amount of Stabulum tokens to buy/sell
+     */
+    function performMarketOperation(bool isBuy, uint256 amount) 
+        external 
+        onlyRole(OPERATOR_ROLE) 
+        nonReentrant 
+    {
+        require(amount <= maxMarketOperation, "Amount exceeds maximum operation size");
+        
+        if (isBuy) {
+            // Buy Stabulum from the market using reserve tokens
+            uint256 reserveAmount = (amount * currentPrice) / 10**18;
+            
+            // Transfer reserve token from contract to the market
+            // This is simplified - actual implementation would integrate with specific DEX
+            reserveToken.safeTransfer(address(this), reserveAmount);
+            
+            emit MarketOperation(true, amount, reserveAmount);
+        } else {
+            // Sell Stabulum to the market for reserve tokens
+            uint256 reserveAmount = (amount * currentPrice) / 10**18;
+            
+            // Transfer Stabulum from contract to the market
+            // This is simplified - actual implementation would integrate with specific DEX
+            stabulumToken.safeTransfer(address(this), amount);
+            
+            emit MarketOperation(false, amount, reserveAmount);
+        }
+    }
+    
+    /**
+     * @dev Update stability fee
+     * @param _newFee New stability fee in basis points
+     */
+    function updateStabilityFee(uint256 _newFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_newFee <= 1000, "Fee too high"); // Max 10%
+        
+        emit StabilityFeeUpdated(stabilityFee, _newFee);
+        stabilityFee = _newFee;
+    }
+    
+    /**
+     * @dev Toggle rebasing functionality
+     * @param _enabled Whether rebasing should be enabled
+     */
+    function setRebasingEnabled(bool _enabled) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        rebasingEnabled = _enabled;
+    }
+    
+    /**
+     * @dev Update rebase parameters
+     * @param _threshold New threshold in basis points
+     * @param _interval New minimum interval between rebases in seconds
+     */
+    function updateRebaseParameters(uint256 _threshold, uint256 _interval) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        rebaseThreshold = _threshold;
+        rebaseInterval = _interval;
+    }
+    
+    /**
+     * @dev Update price tolerance
+     * @param _tolerance New tolerance in basis points
+     */
+    function updatePriceTolerance(uint256 _tolerance) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_tolerance <= 1000, "Tolerance too high"); // Max 10%
+        priceTolerance = _tolerance;
+    }
+    
+    /**
+     * @dev Update target price
+     * @param _targetPrice New target price
+     */
+    function updateTargetPrice(uint256 _targetPrice) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_targetPrice > 0, "Invalid target price");
+        targetPrice = _targetPrice;
+    }
+    
+    /**
+     * @dev Emergency function to recover any ERC20 tokens sent to this contract
+     * @param _token Address of the token to recover
+     */
+    function recoverERC20(address _token) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        uint256 balance = IERC20(_token).balanceOf(address(this));
+        IERC20(_token).safeTransfer(msg.sender, balance);
+    }
+}
+
+/**
+ * @dev Interface for a rebasable token
+ */
+interface IRebasableToken {
+    function rebase(int256 rebaseFactor) external returns (uint256);
+    function totalSupply() external view returns (uint256);
+}
