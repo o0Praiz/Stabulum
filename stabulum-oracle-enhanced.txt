@@ -1,0 +1,579 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+    function description() external view returns (string memory);
+    function version() external view returns (uint256);
+    function getRoundData(uint80 _roundId) external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+    function latestRoundData() external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+}
+
+interface IStabulumReserveManager {
+    function updateAssetPrice(address tokenAddress, uint256 price) external;
+}
+
+/**
+ * @title StabulumOracleIntegration
+ * @dev Oracle integration for the Stabulum stablecoin
+ * Features:
+ * - Price feed aggregation from multiple sources
+ * - Heartbeat checking for price feeds
+ * - Fallback mechanisms
+ * - Integration with reserve manager
+ */
+contract StabulumOracleIntegration is 
+    Initializable, 
+    AccessControlUpgradeable, 
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable 
+{
+    // Role definitions
+    bytes32 public constant ORACLE_ADMIN_ROLE = keccak256("ORACLE_ADMIN_ROLE");
+    bytes32 public constant MANUAL_ORACLE_ROLE = keccak256("MANUAL_ORACLE_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    
+    // Price source types
+    enum PriceSourceType { CHAINLINK, MANUAL, TWAP, FALLBACK }
+    
+    // Reserve manager address
+    address public reserveManager;
+    
+    // Token price feed information
+    struct PriceFeed {
+        address tokenAddress;      // Token address
+        string symbol;             // Token symbol
+        address primarySource;     // Primary price feed address (e.g., Chainlink)
+        address fallbackSource;    // Fallback price feed address
+        PriceSourceType sourceType; // Type of primary source
+        PriceSourceType fallbackType; // Type of fallback source
+        uint256 heartbeatInterval; // Maximum time between updates (in seconds)
+        uint256 deviationThreshold; // Maximum allowed deviation (in basis points)
+        uint256 lastUpdatedAt;     // Last updated timestamp
+        uint256 price;             // Latest price (scaled by 1e18)
+        bool isActive;             // Whether this feed is active
+    }
+    
+    // Mapping from token address to price feed info
+    mapping(address => PriceFeed) public priceFeeds;
+    
+    // Array of token addresses with price feeds
+    address[] public supportedTokens;
+    
+    // TWAP parameters
+    uint256 public twapInterval; // Time window for TWAP (in seconds)
+    
+    // Price update settings
+    uint256 public maxPriceDeviationBps; // Maximum allowed price deviation in basis points
+    uint256 public manualPriceExpiryTime; // Time after which manual prices expire (in seconds)
+    
+    // Events
+    event PriceFeedAdded(address indexed token, string symbol, address primarySource, PriceSourceType sourceType);
+    event PriceFeedUpdated(address indexed token, address primarySource, PriceSourceType sourceType, bool isActive);
+    event PriceUpdated(address indexed token, uint256 price, PriceSourceType sourceType);
+    event FallbackActivated(address indexed token, string reason);
+    event DeviationThresholdExceeded(address indexed token, uint256 oldPrice, uint256 newPrice);
+    event ManualPriceSubmitted(address indexed token, uint256 price, address submitter);
+    
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+    
+    /**
+     * @dev Initializes the contract
+     * @param admin The initial admin address
+     * @param _reserveManager Address of the reserve manager
+     * @param _twapInterval Time window for TWAP
+     * @param _maxPriceDeviationBps Maximum allowed price deviation in basis points
+     * @param _manualPriceExpiryTime Time after which manual prices expire
+     */
+    function initialize(
+        address admin,
+        address _reserveManager,
+        uint256 _twapInterval,
+        uint256 _maxPriceDeviationBps,
+        uint256 _manualPriceExpiryTime
+    ) public initializer {
+        require(_reserveManager != address(0), "Invalid reserve manager address");
+        
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+        
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(ORACLE_ADMIN_ROLE, admin);
+        _grantRole(MANUAL_ORACLE_ROLE, admin);
+        _grantRole(UPGRADER_ROLE, admin);
+        _grantRole(PAUSER_ROLE, admin);
+        
+        reserveManager = _reserveManager;
+        twapInterval = _twapInterval;
+        maxPriceDeviationBps = _maxPriceDeviationBps;
+        manualPriceExpiryTime = _manualPriceExpiryTime;
+    }
+    
+    /**
+     * @dev Add a new price feed
+     * @param tokenAddress Token address
+     * @param symbol Token symbol
+     * @param primarySource Primary price source address
+     * @param fallbackSource Fallback price source address
+     * @param sourceType Type of primary source
+     * @param fallbackType Type of fallback source
+     * @param heartbeatInterval Maximum time between updates
+     * @param deviationThreshold Maximum allowed deviation
+     */
+    function addPriceFeed(
+        address tokenAddress,
+        string memory symbol,
+        address primarySource,
+        address fallbackSource,
+        PriceSourceType sourceType,
+        PriceSourceType fallbackType,
+        uint256 heartbeatInterval,
+        uint256 deviationThreshold
+    ) 
+        external 
+        onlyRole(ORACLE_ADMIN_ROLE) 
+    {
+        require(tokenAddress != address(0), "Invalid token address");
+        require(primarySource != address(0), "Invalid primary source address");
+        require(priceFeeds[tokenAddress].tokenAddress == address(0), "Price feed already exists");
+        
+        // Add the price feed
+        priceFeeds[tokenAddress] = PriceFeed({
+            tokenAddress: tokenAddress,
+            symbol: symbol,
+            primarySource: primarySource,
+            fallbackSource: fallbackSource,
+            sourceType: sourceType,
+            fallbackType: fallbackType,
+            heartbeatInterval: heartbeatInterval,
+            deviationThreshold: deviationThreshold,
+            lastUpdatedAt: 0,
+            price: 0,
+            isActive: true
+        });
+        
+        supportedTokens.push(tokenAddress);
+        
+        emit PriceFeedAdded(tokenAddress, symbol, primarySource, sourceType);
+    }
+    
+    /**
+     * @dev Update an existing price feed
+     * @param tokenAddress Token address
+     * @param primarySource New primary source address
+     * @param fallbackSource New fallback source address
+     * @param sourceType New source type
+     * @param fallbackType New fallback type
+     * @param heartbeatInterval New heartbeat interval
+     * @param deviationThreshold New deviation threshold
+     * @param isActive Whether the feed is active
+     */
+    function updatePriceFeed(
+        address tokenAddress,
+        address primarySource,
+        address fallbackSource,
+        PriceSourceType sourceType,
+        PriceSourceType fallbackType,
+        uint256 heartbeatInterval,
+        uint256 deviationThreshold,
+        bool isActive
+    ) 
+        external 
+        onlyRole(ORACLE_ADMIN_ROLE) 
+    {
+        require(priceFeeds[tokenAddress].tokenAddress != address(0), "Price feed does not exist");
+        require(primarySource != address(0), "Invalid primary source address");
+        
+        PriceFeed storage feed = priceFeeds[tokenAddress];
+        
+        feed.primarySource = primarySource;
+        feed.fallbackSource = fallbackSource;
+        feed.sourceType = sourceType;
+        feed.fallbackType = fallbackType;
+        feed.heartbeatInterval = heartbeatInterval;
+        feed.deviationThreshold = deviationThreshold;
+        feed.isActive = isActive;
+        
+        emit PriceFeedUpdated(tokenAddress, primarySource, sourceType, isActive);
+    }
+    
+    /**
+     * @dev Manually set a price (for authorized oracles)
+     * @param tokenAddress Token address
+     * @param price Price in USD (scaled by 1e18)
+     */
+    function setManualPrice(
+        address tokenAddress,
+        uint256 price
+    ) 
+        external 
+        onlyRole(MANUAL_ORACLE_ROLE) 
+        whenNotPaused 
+    {
+        require(priceFeeds[tokenAddress].tokenAddress != address(0), "Price feed does not exist");
+        require(price > 0, "Price must be greater than zero");
+        
+        PriceFeed storage feed = priceFeeds[tokenAddress];
+        
+        // Check for excessive deviation
+        if (feed.price > 0) {
+            uint256 deviation = calculateDeviation(feed.price, price);
+            if (deviation > feed.deviationThreshold) {
+                emit DeviationThresholdExceeded(tokenAddress, feed.price, price);
+                
+                // If deviation is extreme, reject the update
+                if (deviation > maxPriceDeviationBps) {
+                    revert("Price deviation exceeds maximum allowed");
+                }
+            }
+        }
+        
+        // Update the price
+        feed.price = price;
+        feed.lastUpdatedAt = block.timestamp;
+        
+        // Update the price in the reserve manager
+        IStabulumReserveManager(reserveManager).updateAssetPrice(tokenAddress, price);
+        
+        emit ManualPriceSubmitted(tokenAddress, price, msg.sender);
+        emit PriceUpdated(tokenAddress, price, PriceSourceType.MANUAL);
+    }
+    
+    /**
+     * @dev Fetch and update the price for a token
+     * @param tokenAddress Token address
+     * @return Latest price
+     */
+    function updatePrice(address tokenAddress) 
+        external 
+        whenNotPaused 
+        returns (uint256)
+    {
+        require(priceFeeds[tokenAddress].tokenAddress != address(0), "Price feed does not exist");
+        require(priceFeeds[tokenAddress].isActive, "Price feed is not active");
+        
+        PriceFeed storage feed = priceFeeds[tokenAddress];
+        
+        // Try to get price from primary source
+        (bool success, uint256 newPrice) = getPriceFromSource(
+            tokenAddress,
+            feed.primarySource,
+            feed.sourceType
+        );
+        
+        // If primary source fails, try fallback
+        if (!success && feed.fallbackSource != address(0)) {
+            emit FallbackActivated(tokenAddress, "Primary source failed");
+            
+            (success, newPrice) = getPriceFromSource(
+                tokenAddress,
+                feed.fallbackSource,
+                feed.fallbackType
+            );
+        }
+        
+        // Require successful price update
+        require(success, "Failed to get price from any source");
+        require(newPrice > 0, "Price must be greater than zero");
+        
+        // Check for excessive deviation
+        if (feed.price > 0) {
+            uint256 deviation = calculateDeviation(feed.price, newPrice);
+            if (deviation > feed.deviationThreshold) {
+                emit DeviationThresholdExceeded(tokenAddress, feed.price, newPrice);
+                
+                // If deviation is extreme, reject the update
+                if (deviation > maxPriceDeviationBps) {
+                    revert("Price deviation exceeds maximum allowed");
+                }
+            }
+        }
+        
+        // Update the price
+        feed.price = newPrice;
+        feed.lastUpdatedAt = block.timestamp;
+        
+        // Update the price in the reserve manager
+        IStabulumReserveManager(reserveManager).updateAssetPrice(tokenAddress, newPrice);
+        
+        emit PriceUpdated(tokenAddress, newPrice, feed.sourceType);
+        
+        return newPrice;
+    }
+    
+    /**
+     * @dev Get the latest price for a token
+     * @param tokenAddress Token address
+     * @return Latest price
+     */
+    function getLatestPrice(address tokenAddress) 
+        external 
+        view 
+        returns (uint256)
+    {
+        require(priceFeeds[tokenAddress].tokenAddress != address(0), "Price feed does not exist");
+        require(priceFeeds[tokenAddress].isActive, "Price feed is not active");
+        
+        PriceFeed storage feed = priceFeeds[tokenAddress];
+        
+        // Check if the price is stale
+        if (block.timestamp > feed.lastUpdatedAt + feed.heartbeatInterval) {
+            revert("Price is stale");
+        }
+        
+        return feed.price;
+    }
+    
+    /**
+     * @dev Get price from a specific source
+     * @param tokenAddress Token address
+     * @param source Source address
+     * @param sourceType Type of source
+     * @return success Whether the price was successfully retrieved
+     * @return price Latest price
+     */
+    function getPriceFromSource(
+        address tokenAddress,
+        address source,
+        PriceSourceType sourceType
+    ) 
+        internal 
+        returns (bool success, uint256 price)
+    {
+        if (sourceType == PriceSourceType.CHAINLINK) {
+            return getChainlinkPrice(source);
+        } else if (sourceType == PriceSourceType.MANUAL) {
+            return getManualPrice(tokenAddress);
+        } else if (sourceType == PriceSourceType.TWAP) {
+            return getTWAPPrice(source);
+        } else {
+            return (false, 0);
+        }
+    }
+    
+    /**
+     * @dev Get price from Chainlink
+     * @param feedAddress Chainlink feed address
+     * @return success Whether the price was successfully retrieved
+     * @return price Latest price
+     */
+    function getChainlinkPrice(address feedAddress) 
+        internal 
+        view 
+        returns (bool success, uint256 price)
+    {
+        if (feedAddress == address(0)) return (false, 0);
+        
+        try AggregatorV3Interface(feedAddress).latestRoundData() returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        ) {
+            // Validate the data
+            require(answer > 0, "Negative or zero price");
+            require(updatedAt > 0, "Roundup timestamp is zero");
+            require(answeredInRound >= roundId, "Stale price");
+            
+            // Convert to 18 decimals
+            uint8 decimals = AggregatorV3Interface(feedAddress).decimals();
+            if (decimals == 18) {
+                return (true, uint256(answer));
+            } else if (decimals < 18) {
+                return (true, uint256(answer) * 10**(18 - decimals));
+            } else {
+                return (true, uint256(answer) / 10**(decimals - 18));
+            }
+        } catch {
+            return (false, 0);
+        }
+    }
+    
+    /**
+     * @dev Get manual price
+     * @param tokenAddress Token address
+     * @return success Whether the price was successfully retrieved
+     * @return price Latest price
+     */
+    function getManualPrice(address tokenAddress) 
+        internal 
+        view 
+        returns (bool success, uint256 price)
+    {
+        PriceFeed storage feed = priceFeeds[tokenAddress];
+        
+        // Check if the price is stale
+        if (block.timestamp > feed.lastUpdatedAt + manualPriceExpiryTime) {
+            return (false, 0);
+        }
+        
+        return (true, feed.price);
+    }
+    
+    /**
+     * @dev Get TWAP price (Time-Weighted Average Price)
+     * @param twapSource TWAP source address
+     * @return success Whether the price was successfully retrieved
+     * @return price Latest price
+     */
+    function getTWAPPrice(address twapSource) 
+        internal 
+        returns (bool success, uint256 price)
+    {
+        // This is a placeholder for integrating with TWAP sources like Uniswap
+        // In a real implementation, you would call the appropriate method on the TWAP source
+        return (false, 0);
+    }
+    
+    /**
+     * @dev Calculate deviation between two prices
+     * @param oldPrice Old price
+     * @param newPrice New price
+     * @return deviation Deviation in basis points
+     */
+    function calculateDeviation(uint256 oldPrice, uint256 newPrice) 
+        internal 
+        pure 
+        returns (uint256 deviation)
+    {
+        if (oldPrice == 0 || newPrice == 0) return 0;
+        
+        uint256 absDiff;
+        if (newPrice > oldPrice) {
+            absDiff = newPrice - oldPrice;
+        } else {
+            absDiff = oldPrice - newPrice;
+        }
+        
+        return (absDiff * 10000) / oldPrice;
+    }
+    
+    /**
+     * @dev Check if a price feed is stale
+     * @param tokenAddress Token address
+     * @return Whether the price feed is stale
+     */
+    function isPriceFeedStale(address tokenAddress) 
+        external 
+        view 
+        returns (bool)
+    {
+        require(priceFeeds[tokenAddress].tokenAddress != address(0), "Price feed does not exist");
+        
+        PriceFeed storage feed = priceFeeds[tokenAddress];
+        return block.timestamp > feed.lastUpdatedAt + feed.heartbeatInterval;
+    }
+    
+    /**
+     * @dev Get the number of supported tokens
+     * @return Number of supported tokens
+     */
+    function getSupportedTokenCount() 
+        external 
+        view 
+        returns (uint256)
+    {
+        return supportedTokens.length;
+    }
+    
+    /**
+     * @dev Update the reserve manager address
+     * @param _reserveManager New reserve manager address
+     */
+    function updateReserveManager(address _reserveManager) 
+        external 
+        onlyRole(ORACLE_ADMIN_ROLE) 
+    {
+        require(_reserveManager != address(0), "Invalid reserve manager address");
+        reserveManager = _reserveManager;
+    }
+    
+    /**
+     * @dev Update the TWAP interval
+     * @param _twapInterval New TWAP interval
+     */
+    function updateTWAPInterval(uint256 _twapInterval) 
+        external 
+        onlyRole(ORACLE_ADMIN_ROLE) 
+    {
+        twapInterval = _twapInterval;
+    }
+    
+    /**
+     * @dev Update the maximum price deviation
+     * @param _maxPriceDeviationBps New maximum price deviation
+     */
+    function updateMaxPriceDeviation(uint256 _maxPriceDeviationBps) 
+        external 
+        onlyRole(ORACLE_ADMIN_ROLE) 
+    {
+        maxPriceDeviationBps = _maxPriceDeviationBps;
+    }
+    
+    /**
+     * @dev Update the manual price expiry time
+     * @param _manualPriceExpiryTime New manual price expiry time
+     */
+    function updateManualPriceExpiryTime(uint256 _manualPriceExpiryTime) 
+        external 
+        onlyRole(ORACLE_ADMIN_ROLE) 
+    {
+        manualPriceExpiryTime = _manualPriceExpiryTime;
+    }
+    
+    /**
+     * @dev Pause the contract
+     */
+    function pause() 
+        external 
+        onlyRole(PAUSER_ROLE) 
+    {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpause the contract
+     */
+    function unpause() 
+        external 
+        onlyRole(PAUSER_ROLE) 
+    {
+        _unpause();
+    }
+    
+    /**
+     * @dev Function to authorize an upgrade to the implementation
+     * @param newImplementation Address of the new implementation
+     */
+    function _authorizeUpgrade(address newImplementation) 
+        internal 
+        override 
+        onlyRole(UPGRADER_ROLE) 
+    {}
+}

@@ -1,0 +1,134 @@
+// Enhanced Deployment Script for Stabulum Stablecoin
+// SPDX-License-Identifier: MIT
+// File: scripts/deploy-stabulum.js
+
+const { ethers, upgrades } = require("hardhat");
+
+// Configuration
+const REQUIRED_COLLATERAL_RATIO = 10000; // 100%
+const INITIAL_TRANSFER_FEE = 0; // 0% initially
+const KYC_REQUIRED = true; // KYC required for transfers
+const TWAP_INTERVAL = 86400; // 24 hours
+const MAX_PRICE_DEVIATION_BPS = 1000; // 10% maximum price deviation
+const MANUAL_PRICE_EXPIRY_TIME = 86400; // 24 hours
+
+// Governance parameters
+const VOTING_DELAY = 1; // 1 block
+const VOTING_PERIOD = 45818; // ~1 week
+const PROPOSAL_THRESHOLD = ethers.utils.parseEther("100000"); // 100k tokens
+const QUORUM_PERCENTAGE = 4; // 4% quorum
+
+async function main() {
+  const [deployer, admin, treasury, kycOfficer, reserveManager, priceOracle] = await ethers.getSigners();
+  console.log("Deploying Stabulum contracts with the account:", deployer.address);
+  console.log("Admin address:", admin.address);
+  console.log("Treasury address:", treasury.address);
+
+  // Deploy StabulumToken
+  console.log("\n⏳ Deploying StabulumToken...");
+  const StabulumToken = await ethers.getContractFactory("StabulumToken");
+  const stabulumToken = await upgrades.deployProxy(
+    StabulumToken, 
+    [
+      admin.address, // admin
+      deployer.address, // minter (temporary, will be set to reserve manager)
+      admin.address, // pauser
+      admin.address, // blacklister
+      ethers.constants.AddressZero, // KYC provider (temporary, will be set later)
+      treasury.address, // fee collector
+      KYC_REQUIRED // KYC required for transfers
+    ], 
+    { initializer: 'initialize' }
+  );
+  await stabulumToken.deployed();
+  console.log("✅ StabulumToken deployed to:", stabulumToken.address);
+
+  // Deploy KYCProvider
+  console.log("\n⏳ Deploying StabulumKYCProvider...");
+  const StabulumKYCProvider = await ethers.getContractFactory("StabulumKYCProvider");
+  const kycProvider = await upgrades.deployProxy(
+    StabulumKYCProvider, 
+    [admin.address], 
+    { initializer: 'initialize' }
+  );
+  await kycProvider.deployed();
+  console.log("✅ StabulumKYCProvider deployed to:", kycProvider.address);
+
+  // Grant KYC officer role
+  const KYC_OFFICER_ROLE = await kycProvider.KYC_OFFICER_ROLE();
+  await kycProvider.connect(admin).grantRole(KYC_OFFICER_ROLE, kycOfficer.address);
+  console.log("✅ KYC officer role granted to:", kycOfficer.address);
+
+  // Update KYC provider in token
+  await stabulumToken.connect(admin).setKYCProvider(kycProvider.address);
+  console.log("✅ KYC provider set in token");
+
+  // Deploy OracleIntegration
+  console.log("\n⏳ Deploying StabulumOracleIntegration...");
+  const StabulumOracleIntegration = await ethers.getContractFactory("StabulumOracleIntegration");
+  const oracleIntegration = await upgrades.deployProxy(
+    StabulumOracleIntegration, 
+    [
+      admin.address,
+      ethers.constants.AddressZero, // Reserve manager (temporary, will be set later)
+      TWAP_INTERVAL,
+      MAX_PRICE_DEVIATION_BPS,
+      MANUAL_PRICE_EXPIRY_TIME
+    ], 
+    { initializer: 'initialize' }
+  );
+  await oracleIntegration.deployed();
+  console.log("✅ StabulumOracleIntegration deployed to:", oracleIntegration.address);
+
+  // Grant price oracle role
+  const ORACLE_ROLE = await oracleIntegration.MANUAL_ORACLE_ROLE();
+  await oracleIntegration.connect(admin).grantRole(ORACLE_ROLE, priceOracle.address);
+  console.log("✅ Oracle role granted to:", priceOracle.address);
+
+  // Deploy ReserveManager
+  console.log("\n⏳ Deploying StabulumReserveManager...");
+  const StabulumReserveManager = await ethers.getContractFactory("StabulumReserveManager");
+  const reserveManagerContract = await upgrades.deployProxy(
+    StabulumReserveManager, 
+    [
+      admin.address,
+      stabulumToken.address,
+      oracleIntegration.address,
+      REQUIRED_COLLATERAL_RATIO
+    ], 
+    { initializer: 'initialize' }
+  );
+  await reserveManagerContract.deployed();
+  console.log("✅ StabulumReserveManager deployed to:", reserveManagerContract.address);
+
+  // Update reserve manager in oracle integration
+  await oracleIntegration.connect(admin).updateReserveManager(reserveManagerContract.address);
+  console.log("✅ Reserve manager set in oracle integration");
+
+  // Grant reserve manager role
+  const RESERVE_MANAGER_ROLE = await reserveManagerContract.RESERVE_MANAGER_ROLE();
+  await reserveManagerContract.connect(admin).grantRole(RESERVE_MANAGER_ROLE, reserveManager.address);
+  console.log("✅ Reserve manager role granted to:", reserveManager.address);
+
+  // Grant minter role to reserve manager 
+  const MINTER_ROLE = await stabulumToken.MINTER_ROLE();
+  await stabulumToken.connect(admin).grantRole(MINTER_ROLE, reserveManagerContract.address);
+  console.log("✅ Minter role granted to reserve manager");
+
+  // Grant burner role to reserve manager
+  const BURNER_ROLE = await stabulumToken.BURNER_ROLE();
+  await stabulumToken.connect(admin).grantRole(BURNER_ROLE, reserveManagerContract.address);
+  console.log("✅ Burner role granted to reserve manager");
+
+  // Deploy TimelockController for Governance
+  console.log("\n⏳ Deploying TimelockController...");
+  const minDelay = 2 * 24 * 60 * 60; // 2 days
+  const proposers = [deployer.address];
+  const executors = [deployer.address];
+  const TimelockController = await ethers.getContractFactory("TimelockController");
+  const timelock = await TimelockController.deploy(minDelay, proposers, executors, deployer.address);
+  await timelock.deployed();
+  console.log("✅ TimelockController deployed to:", timelock.address);
+
+  // Deploy Governance Token
+  console.log("\n⏳

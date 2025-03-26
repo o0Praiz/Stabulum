@@ -1,0 +1,450 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20BurnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/CountersUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+
+/**
+ * @title StabulumToken
+ * @dev Implementation of the Stabulum stablecoin with enhanced security features
+ * Features:
+ * - ERC20 standard implementation
+ * - Role-based access control for administrative functions
+ * - KYC verification for transfers
+ * - Blacklisting capability for regulatory compliance
+ * - Pausable functionality for emergency situations
+ * - Upgradeable via UUPS proxy pattern
+ * - Fee mechanism (optional, configurable)
+ * - Transaction monitoring for compliance
+ */
+contract StabulumToken is 
+    Initializable, 
+    ERC20Upgradeable, 
+    ERC20BurnableUpgradeable, 
+    ERC20PausableUpgradeable, 
+    AccessControlUpgradeable, 
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable 
+{
+    using CountersUpgradeable for CountersUpgradeable.Counter;
+
+    // Role definitions
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant BLACKLISTER_ROLE = keccak256("BLACKLISTER_ROLE");
+    bytes32 public constant FEE_MANAGER_ROLE = keccak256("FEE_MANAGER_ROLE");
+    bytes32 public constant RESERVE_MANAGER_ROLE = keccak256("RESERVE_MANAGER_ROLE");
+    
+    // KYC integration
+    address public kycProviderContract;
+    bool public kycRequired;
+    
+    // Fee structure
+    uint256 public transferFee; // Fee in basis points (1/100 of a percent)
+    address public feeCollector;
+    
+    // Transaction limits
+    uint256 public maxTransactionAmount;
+    uint256 public dailyUserLimit;
+    mapping(address => uint256) public dailyTransferAmount;
+    mapping(address => uint256) public lastTransferTimestamp;
+    
+    // Blacklisting for regulatory compliance
+    mapping(address => bool) public blacklisted;
+    
+    // Transaction tracking
+    CountersUpgradeable.Counter private _transactionCounter;
+    mapping(uint256 => TransactionInfo) public transactions;
+    
+    struct TransactionInfo {
+        address from;
+        address to;
+        uint256 amount;
+        uint256 timestamp;
+        uint256 fee;
+    }
+    
+    // Events
+    event TransferWithFee(address indexed from, address indexed to, uint256 amount, uint256 fee);
+    event BlacklistStatusChanged(address indexed account, bool status);
+    event KYCProviderChanged(address indexed oldProvider, address indexed newProvider);
+    event KYCRequirementChanged(bool required);
+    event FeeCollectorChanged(address indexed oldCollector, address indexed newCollector);
+    event FeeUpdated(uint256 oldFee, uint256 newFee);
+    event TransactionLimitsUpdated(uint256 maxTransactionAmount, uint256 dailyUserLimit);
+    event TransactionRecorded(uint256 indexed transactionId, address indexed from, address indexed to, uint256 amount);
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @dev Initializes the Stabulum token contract
+     * @param admin Address with DEFAULT_ADMIN_ROLE
+     * @param minter Address with MINTER_ROLE
+     * @param pauser Address with PAUSER_ROLE
+     * @param blacklister Address with BLACKLISTER_ROLE
+     * @param _kycProviderContract Address of the KYC provider contract
+     * @param _feeCollector Address that collects fees
+     * @param _kycRequired Whether KYC is required for transfers
+     */
+    function initialize(
+        address admin,
+        address minter,
+        address pauser,
+        address blacklister,
+        address _kycProviderContract,
+        address _feeCollector,
+        bool _kycRequired
+    ) initializer public {
+        __ERC20_init("Stabulum", "STAB");
+        __ERC20Burnable_init();
+        __ERC20Pausable_init();
+        __AccessControl_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(MINTER_ROLE, minter);
+        _grantRole(PAUSER_ROLE, pauser);
+        _grantRole(UPGRADER_ROLE, admin);
+        _grantRole(BLACKLISTER_ROLE, blacklister);
+        _grantRole(FEE_MANAGER_ROLE, admin);
+        _grantRole(RESERVE_MANAGER_ROLE, admin);
+        
+        kycProviderContract = _kycProviderContract;
+        kycRequired = _kycRequired;
+        transferFee = 0; // Initially 0
+        feeCollector = _feeCollector;
+        
+        // Set default transaction limits (can be updated later)
+        maxTransactionAmount = 1000000 * 10**18; // 1 million tokens
+        dailyUserLimit = 5000000 * 10**18; // 5 million tokens
+    }
+
+    /**
+     * @dev Mints new tokens
+     * @param to The address that will receive the minted tokens
+     * @param amount The amount of tokens to mint
+     */
+    function mint(address to, uint256 amount) public onlyRole(MINTER_ROLE) whenNotPaused {
+        require(to != address(0), "Cannot mint to zero address");
+        
+        if (kycRequired) {
+            require(isKYCVerified(to), "Recipient not KYC verified");
+        }
+        
+        _mint(to, amount);
+    }
+
+    /**
+     * @dev Burns tokens from a specific address
+     * @param from The address from which to burn tokens
+     * @param amount The amount of tokens to burn
+     */
+    function burnFrom(address from, uint256 amount) public override onlyRole(BURNER_ROLE) whenNotPaused {
+        require(from != address(0), "Cannot burn from zero address");
+        _burn(from, amount);
+    }
+
+    /**
+     * @dev Pauses all token transfers
+     */
+    function pause() public onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @dev Unpauses all token transfers
+     */
+    function unpause() public onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @dev Sets the fee collector address
+     * @param newFeeCollector The new fee collector address
+     */
+    function setFeeCollector(address newFeeCollector) public onlyRole(FEE_MANAGER_ROLE) {
+        require(newFeeCollector != address(0), "Fee collector cannot be zero address");
+        address oldCollector = feeCollector;
+        feeCollector = newFeeCollector;
+        emit FeeCollectorChanged(oldCollector, newFeeCollector);
+    }
+
+    /**
+     * @dev Sets the transfer fee in basis points
+     * @param newFee The new fee in basis points (1/100 of a percent)
+     */
+    function setTransferFee(uint256 newFee) public onlyRole(FEE_MANAGER_ROLE) {
+        require(newFee <= 100, "Fee cannot exceed 1%"); // Max fee is 1%
+        uint256 oldFee = transferFee;
+        transferFee = newFee;
+        emit FeeUpdated(oldFee, newFee);
+    }
+
+    /**
+     * @dev Changes the KYC provider contract
+     * @param newProvider The address of the new KYC provider contract
+     */
+    function setKYCProvider(address newProvider) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newProvider != address(0), "KYC provider cannot be zero address");
+        address oldProvider = kycProviderContract;
+        kycProviderContract = newProvider;
+        emit KYCProviderChanged(oldProvider, newProvider);
+    }
+
+    /**
+     * @dev Sets whether KYC is required for transfers
+     * @param required Whether KYC is required
+     */
+    function setKYCRequired(bool required) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        kycRequired = required;
+        emit KYCRequirementChanged(required);
+    }
+
+    /**
+     * @dev Sets transaction limits
+     * @param _maxTransactionAmount Maximum amount per transaction
+     * @param _dailyUserLimit Maximum amount per user per day
+     */
+    function setTransactionLimits(uint256 _maxTransactionAmount, uint256 _dailyUserLimit) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        maxTransactionAmount = _maxTransactionAmount;
+        dailyUserLimit = _dailyUserLimit;
+        emit TransactionLimitsUpdated(_maxTransactionAmount, _dailyUserLimit);
+    }
+
+    /**
+     * @dev Adds an address to the blacklist
+     * @param account The address to blacklist
+     */
+    function blacklist(address account) public onlyRole(BLACKLISTER_ROLE) {
+        require(account != address(0), "Cannot blacklist zero address");
+        blacklisted[account] = true;
+        emit BlacklistStatusChanged(account, true);
+    }
+
+    /**
+     * @dev Removes an address from the blacklist
+     * @param account The address to remove from the blacklist
+     */
+    function unBlacklist(address account) public onlyRole(BLACKLISTER_ROLE) {
+        blacklisted[account] = false;
+        emit BlacklistStatusChanged(account, false);
+    }
+
+    /**
+     * @dev Check if the user is KYC verified
+     * @param user The address to check
+     * @return bool Whether the user is KYC verified
+     */
+    function isKYCVerified(address user) public view returns (bool) {
+        if (!kycRequired || user == address(0)) {
+            return true;
+        }
+        
+        // Interface for KYC provider contract
+        (bool success, bytes memory data) = kycProviderContract.staticcall(
+            abi.encodeWithSignature("isVerified(address)", user)
+        );
+
+        if (success && data.length >= 32) {
+            return abi.decode(data, (bool));
+        }
+        return false;
+    }
+
+    /**
+     * @dev Reset daily transfer limit when day changes
+     * @param user Address of the user
+     */
+    function _updateDailyLimits(address user) internal {
+        uint256 currentDay = block.timestamp / 1 days;
+        uint256 lastTransferDay = lastTransferTimestamp[user] / 1 days;
+        
+        if (currentDay > lastTransferDay) {
+            dailyTransferAmount[user] = 0;
+        }
+        
+        lastTransferTimestamp[user] = block.timestamp;
+    }
+
+    /**
+     * @dev Record a transaction for compliance monitoring
+     * @param from Sender address
+     * @param to Recipient address
+     * @param amount Transfer amount
+     * @param fee Fee amount
+     * @return Transaction ID
+     */
+    function _recordTransaction(address from, address to, uint256 amount, uint256 fee) internal returns (uint256) {
+        uint256 transactionId = _transactionCounter.current();
+        _transactionCounter.increment();
+        
+        transactions[transactionId] = TransactionInfo({
+            from: from,
+            to: to,
+            amount: amount,
+            timestamp: block.timestamp,
+            fee: fee
+        });
+        
+        emit TransactionRecorded(transactionId, from, to, amount);
+        return transactionId;
+    }
+
+    /**
+     * @dev Override ERC20 transfer function to add compliance checks
+     * @param to Recipient address
+     * @param amount Transfer amount
+     * @return Success status
+     */
+    function transfer(address to, uint256 amount) public override nonReentrant returns (bool) {
+        require(!blacklisted[msg.sender], "Sender is blacklisted");
+        require(!blacklisted[to], "Recipient is blacklisted");
+        
+        if (kycRequired) {
+            require(isKYCVerified(msg.sender), "Sender not KYC verified");
+            require(isKYCVerified(to), "Recipient not KYC verified");
+        }
+        
+        require(amount <= maxTransactionAmount, "Exceeds maximum transaction amount");
+        
+        // Check and update daily limits
+        _updateDailyLimits(msg.sender);
+        require(dailyTransferAmount[msg.sender] + amount <= dailyUserLimit, "Exceeds daily transfer limit");
+        dailyTransferAmount[msg.sender] += amount;
+        
+        uint256 feeAmount = 0;
+        if (transferFee > 0) {
+            feeAmount = (amount * transferFee) / 10000; // Convert basis points
+            uint256 amountAfterFee = amount - feeAmount;
+            
+            super.transfer(feeCollector, feeAmount);
+            bool success = super.transfer(to, amountAfterFee);
+            
+            // Record transaction
+            _recordTransaction(msg.sender, to, amountAfterFee, feeAmount);
+            
+            emit TransferWithFee(msg.sender, to, amountAfterFee, feeAmount);
+            return success;
+        } else {
+            bool success = super.transfer(to, amount);
+            
+            // Record transaction
+            _recordTransaction(msg.sender, to, amount, 0);
+            
+            return success;
+        }
+    }
+
+    /**
+     * @dev Override ERC20 transferFrom function to add compliance checks
+     * @param from Sender address
+     * @param to Recipient address
+     * @param amount Transfer amount
+     * @return Success status
+     */
+    function transferFrom(address from, address to, uint256 amount) public override nonReentrant returns (bool) {
+        require(!blacklisted[from], "Sender is blacklisted");
+        require(!blacklisted[to], "Recipient is blacklisted");
+        
+        if (kycRequired) {
+            require(isKYCVerified(from), "Sender not KYC verified");
+            require(isKYCVerified(to), "Recipient not KYC verified");
+        }
+        
+        require(amount <= maxTransactionAmount, "Exceeds maximum transaction amount");
+        
+        // Check and update daily limits
+        _updateDailyLimits(from);
+        require(dailyTransferAmount[from] + amount <= dailyUserLimit, "Exceeds daily transfer limit");
+        dailyTransferAmount[from] += amount;
+        
+        uint256 feeAmount = 0;
+        if (transferFee > 0) {
+            feeAmount = (amount * transferFee) / 10000; // Convert basis points
+            uint256 amountAfterFee = amount - feeAmount;
+            
+            super.transferFrom(from, feeCollector, feeAmount);
+            bool success = super.transferFrom(from, to, amountAfterFee);
+            
+            // Record transaction
+            _recordTransaction(from, to, amountAfterFee, feeAmount);
+            
+            emit TransferWithFee(from, to, amountAfterFee, feeAmount);
+            return success;
+        } else {
+            bool success = super.transferFrom(from, to, amount);
+            
+            // Record transaction
+            _recordTransaction(from, to, amount, 0);
+            
+            return success;
+        }
+    }
+
+    /**
+     * @dev Get transaction details by ID
+     * @param transactionId ID of the transaction
+     * @return Transaction details
+     */
+    function getTransaction(uint256 transactionId) external view returns (
+        address from,
+        address to,
+        uint256 amount,
+        uint256 timestamp,
+        uint256 fee
+    ) {
+        require(transactionId < _transactionCounter.current(), "Invalid transaction ID");
+        TransactionInfo storage txInfo = transactions[transactionId];
+        
+        return (
+            txInfo.from,
+            txInfo.to,
+            txInfo.amount,
+            txInfo.timestamp,
+            txInfo.fee
+        );
+    }
+
+    /**
+     * @dev Get total transaction count
+     * @return Total number of transactions
+     */
+    function getTransactionCount() external view returns (uint256) {
+        return _transactionCounter.current();
+    }
+
+    /**
+     * @dev Hook that is called before any transfer of tokens
+     */
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal override(ERC20Upgradeable, ERC20PausableUpgradeable) whenNotPaused {
+        super._beforeTokenTransfer(from, to, amount);
+    }
+
+    /**
+     * @dev Returns the address of the current owner (admin role)
+     */
+    function owner() public view returns (address) {
+        return getRoleMember(DEFAULT_ADMIN_ROLE, 0);
+    }
+
+    /**
+     * @dev Function to authorize an upgrade to the implementation
+     */
+    function _authorizeUpgrade(address newImplementation) internal onlyRole(UPGRADER_ROLE) override {}
+}

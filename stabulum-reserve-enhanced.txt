@@ -1,0 +1,792 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+
+/**
+ * @title StabulumReserveManager
+ * @dev Manages the reserve for the Stabulum stablecoin
+ * Features:
+ * - Tracks reserve assets and transactions
+ * - Maintains collateralization ratio
+ * - Provides proof of reserve functionality
+ * - Controls minting and burning based on reserve changes
+ * - Handles multiple collateral asset types
+ */
+contract StabulumReserveManager is 
+    Initializable, 
+    AccessControlUpgradeable, 
+    PausableUpgradeable, 
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable 
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    // Role definitions
+    bytes32 public constant RESERVE_MANAGER_ROLE = keccak256("RESERVE_MANAGER_ROLE");
+    bytes32 public constant AUDITOR_ROLE = keccak256("AUDITOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+    
+    // Address of the Stabulum token contract
+    address public stabulumToken;
+    
+    // Address of the price oracle
+    address public priceOracle;
+    
+    // Reserve collateral asset
+    struct CollateralAsset {
+        address tokenAddress;      // Address of the collateral token
+        string symbol;             // Symbol of the token
+        bool isActive;             // Whether the asset is active
+        uint256 totalDeposited;    // Total amount of this collateral deposited
+        uint256 totalWithdrawn;    // Total amount of this collateral withdrawn
+        uint256 collateralRatio;   // Collateral ratio for this asset (in basis points)
+        uint256 minimumDeposit;    // Minimum deposit amount
+        uint16 decimals;           // Decimals of the token
+    }
+    
+    // Array of supported collateral assets
+    address[] public supportedCollateralAssets;
+    
+    // Mapping from asset address to CollateralAsset structure
+    mapping(address => CollateralAsset) public collateralAssets;
+    
+    // Reserve tracking
+    uint256 public totalReserveValue;    // Total value of reserves in USD (scaled by 1e18)
+    uint256 public totalMintedStabulum;  // Total amount of Stabulum minted
+    uint256 public requiredCollateralRatio; // Required collateral ratio in basis points (e.g., 10000 = 100%)
+    
+    // Reserve transaction types
+    enum TransactionType { DEPOSIT, WITHDRAWAL, AUDIT_ADJUSTMENT, MINT, BURN, ORACLE_UPDATE }
+    
+    // Reserve transaction record
+    struct ReserveTransaction {
+        uint256 id;               // Transaction ID
+        uint256 timestamp;        // Timestamp of the transaction
+        TransactionType txType;   // Type of transaction
+        address token;            // Token address (if applicable)
+        uint256 amount;           // Amount of tokens
+        uint256 stabulumAmount;   // Amount of Stabulum involved (if applicable)
+        address executor;         // Address that executed the transaction
+        uint256 price;            // Price at the time of transaction (if applicable)
+        string description;       // Description of the transaction
+    }
+    
+    // Audit record
+    struct AuditRecord {
+        uint256 id;               // Audit ID
+        uint256 timestamp;        // Timestamp of the audit
+        address auditor;          // Address of the auditor
+        uint256 reserveValue;     // Total value of reserves in USD
+        uint256 mintedStabulum;   // Total minted Stabulum
+        uint256 collateralRatio;  // Collateral ratio at the time of audit
+        string reportURI;         // URI pointing to the detailed audit report
+    }
+    
+    // Array of reserve transactions
+    ReserveTransaction[] public reserveTransactions;
+    
+    // Array of audit records
+    AuditRecord[] public auditRecords;
+    
+    // Mapping from asset to latest price in USD (scaled by 1e18)
+    mapping(address => uint256) public assetPrices;
+    
+    // Mapping from asset to timestamp of last price update
+    mapping(address => uint256) public assetPriceTimestamps;
+    
+    // Mapping from user to deposit limits
+    mapping(address => mapping(address => uint256)) public userDepositLimits; // user -> token -> limit
+    
+    // Events
+    event CollateralAssetAdded(address indexed token, string symbol, uint256 collateralRatio);
+    event CollateralAssetUpdated(address indexed token, bool isActive, uint256 collateralRatio);
+    event ReserveDeposited(uint256 indexed txId, address indexed token, address indexed depositor, uint256 amount, uint256 stabulumMinted);
+    event ReserveWithdrawn(uint256 indexed txId, address indexed token, address indexed recipient, uint256 amount, uint256 stabulumBurned);
+    event ReserveAdjusted(uint256 indexed txId, address indexed auditor, int256 adjustmentAmount, string description);
+    event StabulumMinted(uint256 indexed txId, address indexed to, uint256 amount);
+    event StabulumBurned(uint256 indexed txId, address indexed from, uint256 amount);
+    event AuditCompleted(uint256 indexed auditId, address indexed auditor, uint256 reserveValue, uint256 collateralRatio);
+    event AssetPriceUpdated(address indexed token, uint256 price, address indexed oracle);
+    event CollateralRatioUpdated(uint256 oldRatio, uint256 newRatio);
+    
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+    
+    /**
+     * @dev Initializes the contract
+     * @param admin The initial admin address
+     * @param _stabulumToken The address of the Stabulum token contract
+     * @param _priceOracle The address of the price oracle
+     * @param _requiredCollateralRatio The required collateral ratio in basis points
+     */
+    function initialize(
+        address admin,
+        address _stabulumToken,
+        address _priceOracle,
+        uint256 _requiredCollateralRatio
+    ) public initializer {
+        require(_stabulumToken != address(0), "Invalid Stabulum token address");
+        require(_priceOracle != address(0), "Invalid price oracle address");
+        require(_requiredCollateralRatio >= 10000, "Collateral ratio must be at least 100%");
+        
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+        
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(RESERVE_MANAGER_ROLE, admin);
+        _grantRole(AUDITOR_ROLE, admin);
+        _grantRole(UPGRADER_ROLE, admin);
+        _grantRole(PAUSER_ROLE, admin);
+        _grantRole(ORACLE_ROLE, admin);
+        
+        stabulumToken = _stabulumToken;
+        priceOracle = _priceOracle;
+        requiredCollateralRatio = _requiredCollateralRatio;
+        
+        totalReserveValue = 0;
+        totalMintedStabulum = 0;
+    }
+    
+    /**
+     * @dev Add a new collateral asset
+     * @param tokenAddress Address of the collateral token
+     * @param symbol Symbol of the token
+     * @param collateralRatio Collateral ratio for this asset (in basis points)
+     * @param minimumDeposit Minimum deposit amount
+     * @param decimals Decimals of the token
+     */
+    function addCollateralAsset(
+        address tokenAddress,
+        string memory symbol,
+        uint256 collateralRatio,
+        uint256 minimumDeposit,
+        uint16 decimals
+    ) 
+        external 
+        onlyRole(RESERVE_MANAGER_ROLE) 
+    {
+        require(tokenAddress != address(0), "Invalid token address");
+        require(collateralRatio >= 10000, "Collateral ratio must be at least 100%");
+        require(decimals <= 18, "Decimals cannot exceed 18");
+        require(collateralAssets[tokenAddress].tokenAddress == address(0), "Asset already exists");
+        
+        CollateralAsset storage asset = collateralAssets[tokenAddress];
+        require(asset.tokenAddress != address(0), "Asset not supported");
+        require(asset.isActive, "Asset not active");
+        
+        // Get the price of the asset
+        uint256 price = assetPrices[tokenAddress];
+        require(price > 0, "Price not available");
+        require(block.timestamp - assetPriceTimestamps[tokenAddress] < 1 days, "Price too old");
+        
+        // Calculate the value of Stabulum to be burned
+        uint256 stabulumValue = stabulumAmount; // Assuming 1:1 with USD
+        
+        // Calculate how much collateral to return
+        uint256 collateralToReturn = (stabulumValue * 10**asset.decimals) / price;
+        require(collateralToReturn <= asset.totalDeposited - asset.totalWithdrawn, "Insufficient collateral");
+        
+        // Ensure the withdrawal doesn't breach the global collateralization ratio
+        uint256 valueInUsd = calculateValueInUSD(tokenAddress, collateralToReturn);
+        require(totalReserveValue - valueInUsd >= ((totalMintedStabulum - stabulumAmount) * requiredCollateralRatio) / 10000, 
+                "Withdrawal would breach collateral ratio");
+        
+        // Burn the Stabulum tokens
+        _burnStabulum(msg.sender, stabulumAmount);
+        
+        // Update the asset's withdrawn total
+        asset.totalWithdrawn += collateralToReturn;
+        
+        // Update the total reserve value
+        totalReserveValue -= valueInUsd;
+        
+        // Transfer the collateral token to the recipient
+        IERC20Upgradeable(tokenAddress).safeTransfer(recipient, collateralToReturn);
+        
+        // Record the transaction
+        uint256 txId = _recordTransaction(
+            TransactionType.WITHDRAWAL,
+            tokenAddress,
+            collateralToReturn,
+            stabulumAmount,
+            price,
+            "Burn and withdraw collateral"
+        );
+        
+        emit ReserveWithdrawn(txId, tokenAddress, recipient, collateralToReturn, stabulumAmount);
+        
+        return collateralToReturn;
+    }
+    
+    /**
+     * @dev Mint Stabulum tokens directly (only for authorized addresses)
+     * @param to Address to receive the minted tokens
+     * @param amount Amount of tokens to mint
+     */
+    function mintStabulum(address to, uint256 amount) 
+        external 
+        onlyRole(RESERVE_MANAGER_ROLE) 
+        whenNotPaused 
+    {
+        // Check if there's enough collateral to back the new tokens
+        require(totalReserveValue >= ((totalMintedStabulum + amount) * requiredCollateralRatio) / 10000, 
+                "Insufficient collateral for minting");
+        
+        _mintStabulum(to, amount);
+    }
+    
+    /**
+     * @dev Burn Stabulum tokens directly (only for authorized addresses)
+     * @param from Address from which to burn tokens
+     * @param amount Amount of tokens to burn
+     */
+    function burnStabulum(address from, uint256 amount) 
+        external 
+        onlyRole(RESERVE_MANAGER_ROLE) 
+        whenNotPaused 
+    {
+        _burnStabulum(from, amount);
+    }
+    
+    /**
+     * @dev Record an audit of the reserve
+     * @param reportURI URI pointing to the detailed audit report
+     */
+    function recordAudit(string memory reportURI) 
+        external 
+        onlyRole(AUDITOR_ROLE) 
+        returns (uint256)
+    {
+        // Update the total reserve value based on current prices
+        _updateTotalReserveValue();
+        
+        // Calculate the current collateral ratio
+        uint256 currentRatio = totalMintedStabulum > 0 ? 
+                              (totalReserveValue * 10000) / totalMintedStabulum : 
+                              type(uint256).max;
+        
+        // Create audit record
+        uint256 auditId = auditRecords.length;
+        auditRecords.push(AuditRecord({
+            id: auditId,
+            timestamp: block.timestamp,
+            auditor: msg.sender,
+            reserveValue: totalReserveValue,
+            mintedStabulum: totalMintedStabulum,
+            collateralRatio: currentRatio,
+            reportURI: reportURI
+        }));
+        
+        emit AuditCompleted(auditId, msg.sender, totalReserveValue, currentRatio);
+        
+        return auditId;
+    }
+    
+    /**
+     * @dev Adjust the reserve value (only for auditors)
+     * @param adjustmentAmount Adjustment amount (positive or negative)
+     * @param description Description of the adjustment
+     */
+    function adjustReserveValue(int256 adjustmentAmount, string memory description) 
+        external 
+        onlyRole(AUDITOR_ROLE) 
+    {
+        if (adjustmentAmount > 0) {
+            totalReserveValue += uint256(adjustmentAmount);
+        } else if (adjustmentAmount < 0) {
+            require(totalReserveValue >= uint256(-adjustmentAmount), "Adjustment would result in negative reserve");
+            totalReserveValue -= uint256(-adjustmentAmount);
+        }
+        
+        uint256 txId = reserveTransactions.length;
+        reserveTransactions.push(ReserveTransaction({
+            id: txId,
+            timestamp: block.timestamp,
+            txType: TransactionType.AUDIT_ADJUSTMENT,
+            token: address(0),
+            amount: uint256(adjustmentAmount < 0 ? -adjustmentAmount : adjustmentAmount),
+            stabulumAmount: 0,
+            executor: msg.sender,
+            price: 0,
+            description: description
+        }));
+        
+        emit ReserveAdjusted(txId, msg.sender, adjustmentAmount, description);
+    }
+    
+    /**
+     * @dev Calculate the value of a token amount in USD
+     * @param tokenAddress Address of the token
+     * @param amount Amount of tokens
+     * @return Value in USD (scaled by 1e18)
+     */
+    function calculateValueInUSD(address tokenAddress, uint256 amount) 
+        public 
+        view 
+        returns (uint256) 
+    {
+        require(collateralAssets[tokenAddress].tokenAddress != address(0), "Asset not supported");
+        
+        uint256 price = assetPrices[tokenAddress];
+        require(price > 0, "Price not available");
+        
+        uint16 decimals = collateralAssets[tokenAddress].decimals;
+        return (amount * price) / 10**decimals;
+    }
+    
+    /**
+     * @dev Get the current collateral ratio
+     * @return Collateral ratio in basis points
+     */
+    function getCurrentCollateralRatio() 
+        external 
+        view 
+        returns (uint256)
+    {
+        if (totalMintedStabulum == 0) return type(uint256).max;
+        return (totalReserveValue * 10000) / totalMintedStabulum;
+    }
+    
+    /**
+     * @dev Check if the reserve meets the required collateral ratio
+     * @return True if the reserve meets the required ratio
+     */
+    function isReserveSufficient() 
+        external 
+        view 
+        returns (bool)
+    {
+        if (totalMintedStabulum == 0) return true;
+        uint256 requiredReserve = (totalMintedStabulum * requiredCollateralRatio) / 10000;
+        return totalReserveValue >= requiredReserve;
+    }
+    
+    /**
+     * @dev Get details about a collateral asset
+     * @param tokenAddress Address of the collateral token
+     * @return Asset details
+     */
+    function getCollateralAssetDetails(address tokenAddress) 
+        external 
+        view 
+        returns (
+            address token,
+            string memory symbol,
+            bool isActive,
+            uint256 totalDeposited,
+            uint256 totalWithdrawn,
+            uint256 collateralRatio,
+            uint256 price,
+            uint256 priceTimestamp
+        )
+    {
+        CollateralAsset storage asset = collateralAssets[tokenAddress];
+        require(asset.tokenAddress != address(0), "Asset not supported");
+        
+        return (
+            asset.tokenAddress,
+            asset.symbol,
+            asset.isActive,
+            asset.totalDeposited,
+            asset.totalWithdrawn,
+            asset.collateralRatio,
+            assetPrices[tokenAddress],
+            assetPriceTimestamps[tokenAddress]
+        );
+    }
+    
+    /**
+     * @dev Get the total number of supported collateral assets
+     * @return Number of supported assets
+     */
+    function getSupportedCollateralAssetsCount() 
+        external 
+        view 
+        returns (uint256)
+    {
+        return supportedCollateralAssets.length;
+    }
+    
+    /**
+     * @dev Get details about the latest audit
+     * @return Audit details
+     */
+    function getLatestAudit() 
+        external 
+        view 
+        returns (
+            uint256 id,
+            uint256 timestamp,
+            address auditor,
+            uint256 reserveValue,
+            uint256 mintedStabulum,
+            uint256 collateralRatio,
+            string memory reportURI
+        )
+    {
+        require(auditRecords.length > 0, "No audits recorded");
+        
+        AuditRecord storage audit = auditRecords[auditRecords.length - 1];
+        return (
+            audit.id,
+            audit.timestamp,
+            audit.auditor,
+            audit.reserveValue,
+            audit.mintedStabulum,
+            audit.collateralRatio,
+            audit.reportURI
+        );
+    }
+    
+    /**
+     * @dev Get the total number of transactions
+     * @return Number of transactions
+     */
+    function getTransactionCount() 
+        external 
+        view 
+        returns (uint256)
+    {
+        return reserveTransactions.length;
+    }
+    
+    /**
+     * @dev Get the total number of audits
+     * @return Number of audits
+     */
+    function getAuditCount() 
+        external 
+        view 
+        returns (uint256)
+    {
+        return auditRecords.length;
+    }
+    
+    /**
+     * @dev Internal function to mint Stabulum tokens
+     * @param to Address to receive the minted tokens
+     * @param amount Amount of tokens to mint
+     */
+    function _mintStabulum(address to, uint256 amount) 
+        internal 
+    {
+        // Call the mint function on the Stabulum token contract
+        (bool success, ) = stabulumToken.call(
+            abi.encodeWithSignature("mint(address,uint256)", to, amount)
+        );
+        require(success, "Minting failed");
+        
+        // Update the total minted amount
+        totalMintedStabulum += amount;
+        
+        // Record the transaction
+        uint256 txId = _recordTransaction(
+            TransactionType.MINT,
+            address(0),
+            0,
+            amount,
+            0,
+            "Mint Stabulum tokens"
+        );
+        
+        emit StabulumMinted(txId, to, amount);
+    }
+    
+    /**
+     * @dev Internal function to burn Stabulum tokens
+     * @param from Address from which to burn tokens
+     * @param amount Amount of tokens to burn
+     */
+    function _burnStabulum(address from, uint256 amount) 
+        internal 
+    {
+        // Call the burn function on the Stabulum token contract
+        (bool success, ) = stabulumToken.call(
+            abi.encodeWithSignature("burnFrom(address,uint256)", from, amount)
+        );
+        require(success, "Burning failed");
+        
+        // Update the total minted amount
+        totalMintedStabulum -= amount;
+        
+        // Record the transaction
+        uint256 txId = _recordTransaction(
+            TransactionType.BURN,
+            address(0),
+            0,
+            amount,
+            0,
+            "Burn Stabulum tokens"
+        );
+        
+        emit StabulumBurned(txId, from, amount);
+    }
+    
+    /**
+     * @dev Internal function to record a transaction
+     * @param txType Type of transaction
+     * @param token Token address (if applicable)
+     * @param amount Amount of tokens
+     * @param stabulumAmount Amount of Stabulum tokens
+     * @param price Price at the time of transaction
+     * @param description Description of the transaction
+     * @return Transaction ID
+     */
+    function _recordTransaction(
+        TransactionType txType,
+        address token,
+        uint256 amount,
+        uint256 stabulumAmount,
+        uint256 price,
+        string memory description
+    ) 
+        internal 
+        returns (uint256)
+    {
+        uint256 txId = reserveTransactions.length;
+        reserveTransactions.push(ReserveTransaction({
+            id: txId,
+            timestamp: block.timestamp,
+            txType: txType,
+            token: token,
+            amount: amount,
+            stabulumAmount: stabulumAmount,
+            executor: msg.sender,
+            price: price,
+            description: description
+        }));
+        
+        return txId;
+    }
+    
+    /**
+     * @dev Update the total reserve value based on current prices
+     */
+    function _updateTotalReserveValue() 
+        internal 
+    {
+        uint256 newTotalReserveValue = 0;
+        
+        for (uint i = 0; i < supportedCollateralAssets.length; i++) {
+            address tokenAddress = supportedCollateralAssets[i];
+            CollateralAsset storage asset = collateralAssets[tokenAddress];
+            
+            if (asset.isActive) {
+                uint256 netBalance = asset.totalDeposited - asset.totalWithdrawn;
+                uint256 valueInUSD = calculateValueInUSD(tokenAddress, netBalance);
+                newTotalReserveValue += valueInUSD;
+            }
+        }
+        
+        totalReserveValue = newTotalReserveValue;
+    }
+    
+    /**
+     * @dev Pauses all operations
+     */
+    function pause() 
+        external 
+        onlyRole(PAUSER_ROLE) 
+    {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpauses all operations
+     */
+    function unpause() 
+        external 
+        onlyRole(PAUSER_ROLE) 
+    {
+        _unpause();
+    }
+    
+    /**
+     * @dev Function to authorize an upgrade to the implementation
+     * @param newImplementation Address of the new implementation
+     */
+    function _authorizeUpgrade(address newImplementation) 
+        internal 
+        override 
+        onlyRole(UPGRADER_ROLE) 
+    {}
+} memory newAsset = CollateralAsset({
+            tokenAddress: tokenAddress,
+            symbol: symbol,
+            isActive: true,
+            totalDeposited: 0,
+            totalWithdrawn: 0,
+            collateralRatio: collateralRatio,
+            minimumDeposit: minimumDeposit,
+            decimals: decimals
+        });
+        
+        collateralAssets[tokenAddress] = newAsset;
+        supportedCollateralAssets.push(tokenAddress);
+        
+        emit CollateralAssetAdded(tokenAddress, symbol, collateralRatio);
+    }
+    
+    /**
+     * @dev Update an existing collateral asset
+     * @param tokenAddress Address of the collateral token
+     * @param isActive Whether the asset is active
+     * @param collateralRatio Collateral ratio for this asset (in basis points)
+     * @param minimumDeposit Minimum deposit amount
+     */
+    function updateCollateralAsset(
+        address tokenAddress,
+        bool isActive,
+        uint256 collateralRatio,
+        uint256 minimumDeposit
+    ) 
+        external 
+        onlyRole(RESERVE_MANAGER_ROLE) 
+    {
+        require(collateralAssets[tokenAddress].tokenAddress != address(0), "Asset does not exist");
+        require(collateralRatio >= 10000, "Collateral ratio must be at least 100%");
+        
+        collateralAssets[tokenAddress].isActive = isActive;
+        collateralAssets[tokenAddress].collateralRatio = collateralRatio;
+        collateralAssets[tokenAddress].minimumDeposit = minimumDeposit;
+        
+        emit CollateralAssetUpdated(tokenAddress, isActive, collateralRatio);
+    }
+    
+    /**
+     * @dev Update an asset's price
+     * @param tokenAddress Address of the token
+     * @param price Price in USD (scaled by 1e18)
+     */
+    function updateAssetPrice(
+        address tokenAddress,
+        uint256 price
+    ) 
+        external 
+        onlyRole(ORACLE_ROLE) 
+    {
+        require(price > 0, "Price must be greater than 0");
+        
+        assetPrices[tokenAddress] = price;
+        assetPriceTimestamps[tokenAddress] = block.timestamp;
+        
+        _recordTransaction(
+            TransactionType.ORACLE_UPDATE,
+            tokenAddress,
+            0,
+            0,
+            price,
+            "Oracle price update"
+        );
+        
+        // Update total reserve value
+        _updateTotalReserveValue();
+        
+        emit AssetPriceUpdated(tokenAddress, price, msg.sender);
+    }
+    
+    /**
+     * @dev Update the required collateral ratio
+     * @param newRatio New required collateral ratio in basis points
+     */
+    function updateRequiredCollateralRatio(uint256 newRatio) 
+        external 
+        onlyRole(RESERVE_MANAGER_ROLE) 
+    {
+        require(newRatio >= 10000, "Collateral ratio must be at least 100%");
+        
+        uint256 oldRatio = requiredCollateralRatio;
+        requiredCollateralRatio = newRatio;
+        
+        emit CollateralRatioUpdated(oldRatio, newRatio);
+    }
+    
+    /**
+     * @dev Deposit collateral and mint Stabulum tokens
+     * @param tokenAddress Address of the collateral token
+     * @param amount Amount of collateral to deposit
+     * @param recipient Address to receive the minted Stabulum tokens
+     */
+    function depositCollateralAndMint(
+        address tokenAddress,
+        uint256 amount,
+        address recipient
+    ) 
+        external 
+        whenNotPaused 
+        nonReentrant 
+        returns (uint256)
+    {
+        CollateralAsset storage asset = collateralAssets[tokenAddress];
+        require(asset.tokenAddress != address(0), "Asset not supported");
+        require(asset.isActive, "Asset not active");
+        require(amount >= asset.minimumDeposit, "Below minimum deposit");
+        
+        // Get the price of the asset
+        uint256 price = assetPrices[tokenAddress];
+        require(price > 0, "Price not available");
+        require(block.timestamp - assetPriceTimestamps[tokenAddress] < 1 days, "Price too old");
+        
+        // Calculate the value of the collateral
+        uint256 valueInUsd = calculateValueInUSD(tokenAddress, amount);
+        
+        // Calculate the amount of Stabulum to mint based on the asset's collateral ratio
+        uint256 stabulumToMint = (valueInUsd * 10000) / asset.collateralRatio;
+        
+        // Transfer the collateral token from the depositor to this contract
+        IERC20Upgradeable(tokenAddress).safeTransferFrom(msg.sender, address(this), amount);
+        
+        // Update the asset's deposit total
+        asset.totalDeposited += amount;
+        
+        // Update the total reserve value
+        totalReserveValue += valueInUsd;
+        
+        // Mint Stabulum tokens to the recipient
+        _mintStabulum(recipient, stabulumToMint);
+        
+        // Record the transaction
+        uint256 txId = _recordTransaction(
+            TransactionType.DEPOSIT,
+            tokenAddress,
+            amount,
+            stabulumToMint,
+            price,
+            "Collateral deposit and mint"
+        );
+        
+        emit ReserveDeposited(txId, tokenAddress, msg.sender, amount, stabulumToMint);
+        
+        return stabulumToMint;
+    }
+    
+    /**
+     * @dev Burn Stabulum tokens and withdraw collateral
+     * @param tokenAddress Address of the collateral token to withdraw
+     * @param stabulumAmount Amount of Stabulum to burn
+     * @param recipient Address to receive the withdrawn collateral
+     */
+    function burnAndWithdrawCollateral(
+        address tokenAddress,
+        uint256 stabulumAmount,
+        address recipient
+    ) 
+        external 
+        whenNotPaused 
+        nonReentrant 
+        returns (uint256)
+    {
+        CollateralAsset

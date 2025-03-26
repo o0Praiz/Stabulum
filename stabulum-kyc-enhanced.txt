@@ -1,0 +1,516 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+
+/**
+ * @title StabulumKYCProvider
+ * @dev KYC and AML compliance provider for Stabulum stablecoin
+ * Features:
+ * - User verification status tracking
+ * - Role-based access control for KYC officers
+ * - Verification level system (Basic, Advanced, Premium)
+ * - Expiration management for verifications
+ */
+contract StabulumKYCProvider is 
+    Initializable, 
+    AccessControlUpgradeable, 
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable 
+{
+    // Role definitions
+    bytes32 public constant KYC_OFFICER_ROLE = keccak256("KYC_OFFICER_ROLE");
+    bytes32 public constant COMPLIANCE_ADMIN_ROLE = keccak256("COMPLIANCE_ADMIN_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    
+    // KYC verification status
+    enum VerificationStatus { NONE, PENDING, VERIFIED, REJECTED, EXPIRED }
+    
+    // KYC verification level
+    enum VerificationLevel { NONE, BASIC, ADVANCED, PREMIUM }
+    
+    // User KYC records
+    struct UserRecord {
+        address userAddress;
+        string dataHash;           // Hash of user's KYC data stored off-chain
+        string documentHash;       // Hash of user's verification documents
+        VerificationStatus status;
+        VerificationLevel level;
+        uint256 verificationTime;  // When verification was completed
+        uint256 expirationTime;    // When verification expires
+        address verifier;          // KYC officer who verified
+        string rejectionReason;    // Reason if rejected
+        bool isCorporate;          // Whether this is a corporate account
+        string jurisdiction;       // Legal jurisdiction of the user
+    }
+    
+    // Mapping from user address to verification record
+    mapping(address => UserRecord) public userRecords;
+    
+    // Array of all verified users for easy lookup
+    address[] public verifiedUsers;
+    
+    // Mapping for quick lookup if an address is verified
+    mapping(address => bool) public isVerified;
+    
+    // Verification expiration period by level (in seconds)
+    mapping(VerificationLevel => uint256) public expirationPeriods;
+    
+    // Counter for statistics
+    uint256 public totalUsers;
+    uint256 public pendingVerifications;
+    uint256 public rejectedVerifications;
+    
+    // Risk tracking
+    mapping(address => uint256) public riskScores; // 0-100, higher is riskier
+    
+    // Geographic restrictions
+    mapping(string => bool) public restrictedJurisdictions;
+    
+    // Verification settings
+    bool public enforceDocumentCheck;
+    bool public enforceRiskScoring;
+    
+    // Events
+    event UserRegistered(address indexed userAddress, string dataHash, bool isCorporate);
+    event VerificationRequested(address indexed userAddress, VerificationLevel requestedLevel);
+    event UserVerified(address indexed userAddress, VerificationLevel level, address indexed verifier, uint256 expirationTime);
+    event UserRejected(address indexed userAddress, address indexed verifier, string reason);
+    event VerificationExpired(address indexed userAddress);
+    event RiskScoreUpdated(address indexed userAddress, uint256 oldScore, uint256 newScore);
+    event JurisdictionRestrictionChanged(string jurisdiction, bool isRestricted);
+    event ExpirationPeriodChanged(VerificationLevel level, uint256 periodInSeconds);
+    event VerificationSettingsChanged(bool documentCheck, bool riskScoring);
+    
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+    
+    /**
+     * @dev Initializes the contract
+     * @param admin The initial admin address
+     */
+    function initialize(address admin) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+        
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(KYC_OFFICER_ROLE, admin);
+        _grantRole(COMPLIANCE_ADMIN_ROLE, admin);
+        _grantRole(UPGRADER_ROLE, admin);
+        _grantRole(PAUSER_ROLE, admin);
+        
+        // Set default expiration periods
+        expirationPeriods[VerificationLevel.BASIC] = 365 days;     // 1 year
+        expirationPeriods[VerificationLevel.ADVANCED] = 730 days;  // 2 years
+        expirationPeriods[VerificationLevel.PREMIUM] = 1095 days;  // 3 years
+        
+        // Default settings
+        enforceDocumentCheck = true;
+        enforceRiskScoring = true;
+    }
+    
+    /**
+     * @dev Register a new user for KYC verification
+     * @param dataHash Hash of user's KYC data stored off-chain
+     * @param isCorporate Whether this is a corporate account
+     * @param jurisdiction Legal jurisdiction of the user
+     */
+    function registerUser(
+        string memory dataHash,
+        bool isCorporate,
+        string memory jurisdiction
+    ) 
+        external 
+        whenNotPaused 
+    {
+        require(bytes(dataHash).length > 0, "Data hash cannot be empty");
+        require(!restrictedJurisdictions[jurisdiction], "Jurisdiction is restricted");
+        
+        UserRecord storage record = userRecords[msg.sender];
+        
+        // Initialize or update user record
+        if (record.userAddress == address(0)) {
+            record.userAddress = msg.sender;
+            record.status = VerificationStatus.NONE;
+            record.level = VerificationLevel.NONE;
+            totalUsers++;
+        } else {
+            // Existing user updating information
+            require(record.status != VerificationStatus.PENDING, "Verification already pending");
+        }
+        
+        record.dataHash = dataHash;
+        record.isCorporate = isCorporate;
+        record.jurisdiction = jurisdiction;
+        
+        emit UserRegistered(msg.sender, dataHash, isCorporate);
+    }
+    
+    /**
+     * @dev Request verification at a specific level
+     * @param level Requested verification level
+     * @param documentHash Hash of verification documents
+     */
+    function requestVerification(
+        VerificationLevel level,
+        string memory documentHash
+    ) 
+        external 
+        whenNotPaused 
+    {
+        require(level > VerificationLevel.NONE, "Invalid verification level");
+        require(bytes(documentHash).length > 0 || !enforceDocumentCheck, "Document hash required");
+        
+        UserRecord storage record = userRecords[msg.sender];
+        require(record.userAddress != address(0), "User not registered");
+        
+        // Update record to pending
+        record.status = VerificationStatus.PENDING;
+        record.documentHash = documentHash;
+        pendingVerifications++;
+        
+        emit VerificationRequested(msg.sender, level);
+    }
+    
+    /**
+     * @dev Verify a user after KYC check
+     * @param userAddress Address of the user to verify
+     * @param level Verification level to assign
+     * @param riskScore Assigned risk score (0-100)
+     */
+    function verifyUser(
+        address userAddress, 
+        VerificationLevel level,
+        uint256 riskScore
+    ) 
+        external 
+        onlyRole(KYC_OFFICER_ROLE) 
+        whenNotPaused 
+        nonReentrant
+    {
+        require(userAddress != address(0), "Invalid user address");
+        require(level > VerificationLevel.NONE, "Invalid verification level");
+        require(riskScore <= 100, "Risk score must be 0-100");
+        
+        UserRecord storage record = userRecords[userAddress];
+        require(record.userAddress == userAddress, "User not registered");
+        
+        if (record.status == VerificationStatus.PENDING) {
+            pendingVerifications--;
+        }
+        
+        // Set verification details
+        record.status = VerificationStatus.VERIFIED;
+        record.level = level;
+        record.verificationTime = block.timestamp;
+        record.expirationTime = block.timestamp + expirationPeriods[level];
+        record.verifier = msg.sender;
+        
+        // Update risk score
+        uint256 oldRiskScore = riskScores[userAddress];
+        riskScores[userAddress] = riskScore;
+        
+        // Add to verified users list if not already added
+        if (!isVerified[userAddress]) {
+            verifiedUsers.push(userAddress);
+            isVerified[userAddress] = true;
+        }
+        
+        emit UserVerified(userAddress, level, msg.sender, record.expirationTime);
+        emit RiskScoreUpdated(userAddress, oldRiskScore, riskScore);
+    }
+    
+    /**
+     * @dev Reject a user's KYC verification
+     * @param userAddress Address of the user to reject
+     * @param reason Reason for rejection
+     */
+    function rejectUser(
+        address userAddress, 
+        string memory reason
+    ) 
+        external 
+        onlyRole(KYC_OFFICER_ROLE) 
+        whenNotPaused 
+        nonReentrant
+    {
+        require(userAddress != address(0), "Invalid user address");
+        require(bytes(reason).length > 0, "Reason cannot be empty");
+        
+        UserRecord storage record = userRecords[userAddress];
+        require(record.userAddress == userAddress, "User not registered");
+        
+        if (record.status == VerificationStatus.PENDING) {
+            pendingVerifications--;
+        }
+        
+        // Update record
+        record.status = VerificationStatus.REJECTED;
+        record.rejectionReason = reason;
+        record.verifier = msg.sender;
+        rejectedVerifications++;
+        
+        // Remove from verified users if previously verified
+        if (isVerified[userAddress]) {
+            removeFromVerifiedUsers(userAddress);
+            isVerified[userAddress] = false;
+        }
+        
+        emit UserRejected(userAddress, msg.sender, reason);
+    }
+    
+    /**
+     * @dev Check if a verification is expired and update status if needed
+     * @param userAddress Address to check
+     * @return bool Whether verification is active
+     */
+    function checkAndUpdateExpiration(address userAddress) public returns (bool) {
+        UserRecord storage record = userRecords[userAddress];
+        
+        if (record.status != VerificationStatus.VERIFIED) {
+            return false;
+        }
+        
+        if (block.timestamp > record.expirationTime) {
+            record.status = VerificationStatus.EXPIRED;
+            
+            // Remove from verified users
+            if (isVerified[userAddress]) {
+                removeFromVerifiedUsers(userAddress);
+                isVerified[userAddress] = false;
+            }
+            
+            emit VerificationExpired(userAddress);
+            return false;
+        }
+        
+        return true;
+    }
+    
+    /**
+     * @dev External function to check if a user is verified
+     * @param userAddress Address to check
+     * @return bool Whether the user is verified
+     */
+    function isVerified(address userAddress) external returns (bool) {
+        return checkAndUpdateExpiration(userAddress);
+    }
+    
+    /**
+     * @dev View function to check if a user is verified without updating state
+     * @param userAddress Address to check
+     * @return bool Whether the user is verified
+     */
+    function isVerifiedView(address userAddress) external view returns (bool) {
+        UserRecord storage record = userRecords[userAddress];
+        
+        if (record.status != VerificationStatus.VERIFIED) {
+            return false;
+        }
+        
+        if (block.timestamp > record.expirationTime) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    /**
+     * @dev Get the verification level of a user
+     * @param userAddress Address to check
+     * @return VerificationLevel The user's verification level
+     */
+    function getVerificationLevel(address userAddress) external view returns (VerificationLevel) {
+        UserRecord storage record = userRecords[userAddress];
+        
+        if (record.status != VerificationStatus.VERIFIED || block.timestamp > record.expirationTime) {
+            return VerificationLevel.NONE;
+        }
+        
+        return record.level;
+    }
+    
+    /**
+     * @dev Get the risk score for a user
+     * @param userAddress Address to check
+     * @return uint256 Risk score (0-100)
+     */
+    function getRiskScore(address userAddress) external view returns (uint256) {
+        return riskScores[userAddress];
+    }
+    
+    /**
+     * @dev Set the risk score for a user
+     * @param userAddress Address to update
+     * @param riskScore New risk score (0-100)
+     */
+    function setRiskScore(address userAddress, uint256 riskScore) 
+        external 
+        onlyRole(KYC_OFFICER_ROLE) 
+    {
+        require(riskScore <= 100, "Risk score must be 0-100");
+        
+        uint256 oldRiskScore = riskScores[userAddress];
+        riskScores[userAddress] = riskScore;
+        
+        emit RiskScoreUpdated(userAddress, oldRiskScore, riskScore);
+    }
+    
+    /**
+     * @dev Set restriction status for a jurisdiction
+     * @param jurisdiction Jurisdiction code
+     * @param isRestricted Whether the jurisdiction is restricted
+     */
+    function setJurisdictionRestriction(string memory jurisdiction, bool isRestricted) 
+        external 
+        onlyRole(COMPLIANCE_ADMIN_ROLE) 
+    {
+        restrictedJurisdictions[jurisdiction] = isRestricted;
+        emit JurisdictionRestrictionChanged(jurisdiction, isRestricted);
+    }
+    
+    /**
+     * @dev Set expiration period for a verification level
+     * @param level Verification level
+     * @param periodInSeconds Expiration period in seconds
+     */
+    function setExpirationPeriod(VerificationLevel level, uint256 periodInSeconds) 
+        external 
+        onlyRole(COMPLIANCE_ADMIN_ROLE) 
+    {
+        require(level > VerificationLevel.NONE, "Invalid verification level");
+        require(periodInSeconds > 0, "Period must be greater than zero");
+        
+        expirationPeriods[level] = periodInSeconds;
+        emit ExpirationPeriodChanged(level, periodInSeconds);
+    }
+    
+    /**
+     * @dev Set verification enforcement settings
+     * @param _enforceDocumentCheck Whether to enforce document checks
+     * @param _enforceRiskScoring Whether to enforce risk scoring
+     */
+    function setVerificationSettings(bool _enforceDocumentCheck, bool _enforceRiskScoring) 
+        external 
+        onlyRole(COMPLIANCE_ADMIN_ROLE) 
+    {
+        enforceDocumentCheck = _enforceDocumentCheck;
+        enforceRiskScoring = _enforceRiskScoring;
+        
+        emit VerificationSettingsChanged(_enforceDocumentCheck, _enforceRiskScoring);
+    }
+    
+    /**
+     * @dev Get detailed user record
+     * @param userAddress Address of the user
+     * @return User record details
+     */
+    function getUserRecord(address userAddress) 
+        external 
+        view 
+        returns (
+            address addr,
+            VerificationStatus status,
+            VerificationLevel level,
+            uint256 verificationTime,
+            uint256 expirationTime,
+            address verifier,
+            bool isCorporate,
+            string memory jurisdiction,
+            uint256 riskScore
+        ) 
+    {
+        UserRecord storage record = userRecords[userAddress];
+        bool isExpired = record.status == VerificationStatus.VERIFIED && 
+                         block.timestamp > record.expirationTime;
+        
+        VerificationStatus currentStatus = isExpired ? VerificationStatus.EXPIRED : record.status;
+        
+        return (
+            record.userAddress,
+            currentStatus,
+            record.level,
+            record.verificationTime,
+            record.expirationTime,
+            record.verifier,
+            record.isCorporate,
+            record.jurisdiction,
+            riskScores[userAddress]
+        );
+    }
+    
+    /**
+     * @dev Get the number of verified users
+     * @return The number of verified users
+     */
+    function getVerifiedUserCount() external view returns (uint256) {
+        return verifiedUsers.length;
+    }
+    
+    /**
+     * @dev Get statistics about verifications
+     * @return Statistics about the system
+     */
+    function getVerificationStats() 
+        external 
+        view 
+        returns (
+            uint256 total,
+            uint256 pending,
+            uint256 rejected,
+            uint256 verified
+        ) 
+    {
+        return (
+            totalUsers,
+            pendingVerifications,
+            rejectedVerifications,
+            verifiedUsers.length
+        );
+    }
+    
+    /**
+     * @dev Internal function to remove an address from the verified users array
+     * @param userAddress Address to remove
+     */
+    function removeFromVerifiedUsers(address userAddress) internal {
+        for (uint256 i = 0; i < verifiedUsers.length; i++) {
+            if (verifiedUsers[i] == userAddress) {
+                // Replace with the last element and pop
+                verifiedUsers[i] = verifiedUsers[verifiedUsers.length - 1];
+                verifiedUsers.pop();
+                break;
+            }
+        }
+    }
+    
+    /**
+     * @dev Pause the contract
+     */
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpause the contract
+     */
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+    
+    /**
+     * @dev Function that should revert when `msg.sender` is not authorized to upgrade the contract
+     * @param newImplementation Address of the new implementation
+     */
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
+}
